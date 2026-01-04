@@ -10,11 +10,22 @@ use crate::cred::Cred;
 use crate::utils::enumerate_credentials;
 
 /// The store for Windows native credentials
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Store {
     pub id: String,
     pub delimiters: [String; 3],
     pub service_no_divider: bool,
+}
+
+impl std::fmt::Debug for Store {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Store")
+            .field("vendor", &self.vendor())
+            .field("id", &self.id)
+            .field("delimiters", &self.delimiters)
+            .field("service_no_divider", &self.service_no_divider)
+            .finish()
+    }
 }
 
 impl Store {
