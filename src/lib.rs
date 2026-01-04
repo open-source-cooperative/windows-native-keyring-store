@@ -61,7 +61,7 @@ their writeable attributes can be set using the
 ## Search
 
 This credential store module supports searching for existing credentials.
-You can (optionally) specify a regular-expression pattern to be matched against each
+You can (optionally) specify a regular-expression `pattern` to be matched against each
 credential's `target_name`. If you don't specify a pattern, all existing
 generic credentials are returned.
 
