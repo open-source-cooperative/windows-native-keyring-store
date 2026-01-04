@@ -259,10 +259,8 @@ pub fn cred_from_credential(credential: &mut CREDENTIALW) -> Cred {
         _ => CredPersist::Enterprise,
     };
     let target_name = unsafe { from_wstr(credential.TargetName) };
-    let user = unsafe { from_wstr(credential.UserName) };
     Cred {
         target_name,
-        user,
         specifiers: None,
         persistence,
     }
@@ -307,6 +305,9 @@ pub fn extract_secret(credential: &CREDENTIALW) -> Result<Vec<u8>> {
 /// A metadata extractor for use with [extract_from_credential].
 pub fn extract_attributes(credential: &CREDENTIALW) -> Result<HashMap<String, String>> {
     let result = HashMap::from([
+        ("target_name".to_string(), unsafe {
+            from_wstr(credential.TargetName)
+        }),
         ("username".to_string(), unsafe {
             from_wstr(credential.UserName)
         }),
