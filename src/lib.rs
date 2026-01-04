@@ -42,21 +42,21 @@ but you can specify a desired persistence by using the `persistence` modifier at
 creation time with a (case-insensitive) value of `Session`, `Local`, or `Enterprise`. Note
 that this type will only be applied when the credential's secret is written; it does not
 control the persistence of an existing credential in the store whose value is read via the entry.
-
-The persistence of an existing credential can be read and updated via its `persistence` attribute.
-Note that updating this attribute on an existing credential does `not` update the remembered
-persistence in the entry used to access that credential. Thus, setting the secret in a credential
-always changes its persistence to match that specified when the entry was created.
+The persistence of an existing credential can be read via its `persistence` attribute.
 
 ## Attributes
 
 In addition to the `persistence` attribute mentioned in the last section,
-there are three string attributes that are held on each generic credential:
-`target_alias`, `username`, and `comment`. The `username` attribute will be set
-from the `user` specifier whenever an entry is written.
-All four attributes on existing credentials can be read and set using the
-[get_attributes](keyring_core::Entry::get_attributes) and
-[update_attributes](keyring_core::Entry::update_attributes) methods.
+there are four string attributes that are held on each generic credential:
+`target_name`, `target_alias`, `username`, and `comment`.
+The `target_name` attribute is read-only (because it's the unique ID
+for the credential in the store).
+The `username` attribute in an entry created from a specifier will start
+off as the specifier's `user`.
+All the attributes on existing credentials can be read using the
+[get_attributes](keyring_core::Entry::get_attributes) method, and
+their writeable attributes can be set using the
+[update_attributes](keyring_core::Entry::update_attributes) method.
 
 ## Search
 

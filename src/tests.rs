@@ -451,21 +451,6 @@ fn test_credential_persistence() {
         mock_session.get_attributes().unwrap()["persistence"],
         "Session"
     );
-    local
-        .update_attributes(&HashMap::from([("persistence", "Enterprise")]))
-        .unwrap();
-    assert_eq!(local.get_attributes().unwrap()["persistence"], "Enterprise");
-    assert_ne!(
-        local.as_any().downcast_ref::<Cred>().unwrap().persistence,
-        local
-            .get_credential()
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Cred>()
-            .unwrap()
-            .persistence
-    );
-    assert_eq!(local.get_password().unwrap(), "local");
     mock_session.delete_credential().unwrap();
     session.delete_credential().unwrap_err();
     local.delete_credential().unwrap();

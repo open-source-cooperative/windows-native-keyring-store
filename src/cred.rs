@@ -22,7 +22,6 @@ use crate::utils::{
 #[derive(Debug, Clone)]
 pub(crate) struct Cred {
     pub target_name: String,
-    pub user: String,
     pub specifiers: Option<(String, String)>,
     pub persistence: CredPersist,
 }
@@ -41,7 +40,6 @@ impl Cred {
         user: &str,
         persistence: CredPersist,
     ) -> Result<Self> {
-        let user = user.to_string();
         let (target_name, specifiers) = match target {
             Some(value) => (value.to_string(), None),
             None => {
@@ -60,10 +58,14 @@ impl Cred {
                 )
             }
         };
-        validate_target(&target_name, &user)?;
+        validate_target(
+            &target_name,
+            &specifiers
+                .as_ref()
+                .map_or_else(String::new, |s| s.1.clone()),
+        )?;
         Ok(Self {
             target_name,
-            user,
             specifiers,
             persistence,
         })
@@ -88,7 +90,11 @@ impl CredentialApi for Cred {
     /// See the keyring-core API docs.
     fn set_secret(&self, secret: &[u8]) -> Result<()> {
         validate_secret(secret)?;
-        let mut username = self.user.clone();
+        let mut username = if let Some((_, user)) = &self.specifiers {
+            user.to_owned()
+        } else {
+            String::new()
+        };
         let mut target_alias = String::new();
         let mut comment = String::new();
         if let Ok(attributes) = self.get_attributes() {
@@ -123,10 +129,7 @@ impl CredentialApi for Cred {
 
     /// See the keyring-core API docs.
     fn update_attributes(&self, attributes: &HashMap<&str, &str>) -> Result<()> {
-        let new = parse_attributes(
-            &["username", "target_alias", "comment", "persistence"],
-            Some(attributes),
-        )?;
+        let new = parse_attributes(&["username", "target_alias", "comment"], Some(attributes))?;
         let old = self.get_attributes()?;
         let username = new
             .get("username")
@@ -140,10 +143,6 @@ impl CredentialApi for Cred {
             .get("comment")
             .cloned()
             .unwrap_or_else(|| old["comment"].clone());
-        let persistence = new
-            .get("persistence")
-            .cloned()
-            .unwrap_or_else(|| old["persistence"].clone());
         validate_attributes(&username, &target_alias, &comment)?;
         let mut secret = self.get_secret()?;
         let result = save_credential(
@@ -152,7 +151,7 @@ impl CredentialApi for Cred {
             &target_alias,
             &comment,
             &secret,
-            &persistence.as_str().parse()?,
+            &self.persistence,
         );
         // erase the copy of the secret
         secret.zeroize();
