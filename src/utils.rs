@@ -17,6 +17,12 @@ use zeroize::Zeroize;
 use crate::cred::Cred;
 use keyring_core::error::{Error, Result};
 
+/// Marker stored in the credential's comment field to indicate that
+/// biometric verification is required. This allows "naive" clients
+/// (that don't use the `require-biometric` modifier) to respect the
+/// biometric intent set by the credential's original creator.
+pub(crate) const BIOMETRIC_MARKER: &str = "[keyring:biometric]";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[repr(u32)]
 pub enum CredPersist {
@@ -98,6 +104,32 @@ pub fn validate_secret(secret: &[u8]) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+pub fn validate_secret_for_encryption(secret: &[u8]) -> Result<()> {
+    let max_plaintext =
+        CRED_MAX_CREDENTIAL_BLOB_SIZE as usize - crate::crypto::ENCRYPTION_OVERHEAD;
+    if secret.len() > max_plaintext {
+        return Err(Error::TooLong(
+            String::from("secret (encrypted)"),
+            max_plaintext as u32,
+        ));
+    }
+    Ok(())
+}
+
+pub fn decode_utf16_password(blob: &[u8]) -> Result<String> {
+    if blob.len() % 2 != 0 {
+        return Err(Error::BadEncoding(blob.to_vec()));
+    }
+    let mut blob_u16 = vec![0u16; blob.len() / 2];
+    LittleEndian::read_u16_into(blob, &mut blob_u16);
+    let result = match String::from_utf16(&blob_u16) {
+        Err(_) => Err(Error::BadEncoding(blob.to_vec())),
+        Ok(s) => Ok(s),
+    };
+    blob_u16.zeroize();
+    result
 }
 
 pub fn validate_attributes(username: &str, target_alias: &str, comment: &str) -> Result<()> {
@@ -259,10 +291,13 @@ pub fn cred_from_credential(credential: &mut CREDENTIALW) -> Cred {
         _ => CredPersist::Enterprise,
     };
     let target_name = unsafe { from_wstr(credential.TargetName) };
+    let comment = unsafe { from_wstr(credential.Comment) };
+    let require_biometric = comment.contains(BIOMETRIC_MARKER);
     Cred {
         target_name,
         specifiers: None,
         persistence,
+        require_biometric,
     }
 }
 

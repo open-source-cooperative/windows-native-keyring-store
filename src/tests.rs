@@ -492,3 +492,246 @@ fn test_store_persistence() {
         CredentialPersistence::UntilDelete
     ));
 }
+
+#[test]
+fn test_biometric_entry_builds() {
+    SET_STORE.call_once(usually_goes_in_main);
+    let modifiers = HashMap::from([("require-biometric", "true")]);
+    let entry = Entry::new_with_modifiers("test-bio-build", "user", &modifiers);
+    assert!(entry.is_ok(), "Should be able to build a biometric entry");
+}
+
+#[test]
+fn test_non_biometric_entry_unaffected() {
+    let name = generate_random_string();
+    let entry = entry_new(&name, &name);
+    test_round_trip("non-biometric still works", &entry, "no bio needed");
+}
+
+#[test]
+fn test_biometric_availability() {
+    let available = crate::biometric::is_available();
+    println!("Windows Hello available: {available}");
+}
+
+#[test]
+#[ignore]
+fn test_biometric_round_trip_password() {
+    SET_STORE.call_once(usually_goes_in_main);
+    let name = generate_random_string();
+    let modifiers = HashMap::from([("require-biometric", "true")]);
+    let entry = entry_new_with_modifiers(&name, &name, &modifiers);
+    entry
+        .set_password("biometric-protected-password")
+        .expect("set_password with biometric should succeed");
+    let password = entry
+        .get_password()
+        .expect("get_password with biometric should succeed");
+    assert_eq!(password, "biometric-protected-password");
+    entry
+        .delete_credential()
+        .expect("delete_credential with biometric should succeed");
+    assert!(matches!(entry.get_password(), Err(Error::NoEntry) | Err(Error::NoStorageAccess(_))));
+}
+
+#[test]
+#[ignore]
+fn test_biometric_round_trip_secret() {
+    SET_STORE.call_once(usually_goes_in_main);
+    let name = generate_random_string();
+    let modifiers = HashMap::from([("require-biometric", "true")]);
+    let entry = entry_new_with_modifiers(&name, &name, &modifiers);
+    let secret = generate_random_bytes();
+    entry
+        .set_secret(&secret)
+        .expect("set_secret with biometric should succeed");
+    let out_secret = entry
+        .get_secret()
+        .expect("get_secret with biometric should succeed");
+    assert_eq!(secret, out_secret);
+    entry
+        .delete_credential()
+        .expect("delete_credential with biometric should succeed");
+}
+
+#[test]
+fn test_biometric_get_attributes_no_prompt() {
+    SET_STORE.call_once(usually_goes_in_main);
+    let name = generate_random_string();
+    let modifiers = HashMap::from([("require-biometric", "true")]);
+    let entry = entry_new_with_modifiers(&name, &name, &modifiers);
+    let plain_entry = entry_new(&name, &name);
+    plain_entry.set_password("test").unwrap();
+    let attrs = entry.get_attributes().unwrap();
+    assert_eq!(attrs["username"], name);
+    plain_entry.delete_credential().unwrap();
+}
+
+#[test]
+fn test_crypto_encrypt_decrypt_round_trip() {
+    let key: [u8; 32] = [0x42; 32];
+    let plaintext = b"hello, world!";
+    let encrypted = crate::crypto::encrypt(&key, plaintext).unwrap();
+    assert!(crate::crypto::is_encrypted(&encrypted));
+    let decrypted = crate::crypto::decrypt(&key, &encrypted).unwrap();
+    assert_eq!(plaintext.as_slice(), &decrypted);
+}
+
+#[test]
+fn test_crypto_is_encrypted_detection() {
+    let mut blob = Vec::new();
+    blob.extend_from_slice(b"KRB\x01");
+    blob.extend_from_slice(&[0u8; 12]);
+    blob.extend_from_slice(&[0u8; 16]);
+    assert!(crate::crypto::is_encrypted(&blob));
+    assert!(!crate::crypto::is_encrypted(b"plain text"));
+    assert!(!crate::crypto::is_encrypted(b""));
+    assert!(!crate::crypto::is_encrypted(b"KRB"));
+}
+
+#[test]
+fn test_crypto_encrypt_produces_different_nonces() {
+    let key: [u8; 32] = [0xAB; 32];
+    let plaintext = b"same data";
+    let enc1 = crate::crypto::encrypt(&key, plaintext).unwrap();
+    let enc2 = crate::crypto::encrypt(&key, plaintext).unwrap();
+    assert_ne!(enc1, enc2);
+    assert_eq!(
+        crate::crypto::decrypt(&key, &enc1).unwrap(),
+        crate::crypto::decrypt(&key, &enc2).unwrap()
+    );
+}
+
+#[test]
+fn test_crypto_decrypt_with_wrong_key_fails() {
+    let key_a: [u8; 32] = [0x11; 32];
+    let key_b: [u8; 32] = [0x22; 32];
+    let encrypted = crate::crypto::encrypt(&key_a, b"secret").unwrap();
+    let result = crate::crypto::decrypt(&key_b, &encrypted);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_crypto_decrypt_tampered_blob_fails() {
+    let key: [u8; 32] = [0x33; 32];
+    let mut encrypted = crate::crypto::encrypt(&key, b"secret data").unwrap();
+    let last = encrypted.len() - 1;
+    encrypted[last] ^= 0xFF;
+    let result = crate::crypto::decrypt(&key, &encrypted);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_crypto_encrypted_blob_size() {
+    let key: [u8; 32] = [0x44; 32];
+    let plaintext = vec![0u8; 100];
+    let encrypted = crate::crypto::encrypt(&key, &plaintext).unwrap();
+    assert_eq!(
+        encrypted.len(),
+        plaintext.len() + crate::crypto::ENCRYPTION_OVERHEAD
+    );
+}
+
+#[test]
+fn test_crypto_max_plaintext_fits_after_encryption() {
+    use windows_sys::Win32::Security::Credentials::CRED_MAX_CREDENTIAL_BLOB_SIZE;
+    let max_plaintext =
+        CRED_MAX_CREDENTIAL_BLOB_SIZE as usize - crate::crypto::ENCRYPTION_OVERHEAD;
+    let key: [u8; 32] = [0x55; 32];
+    let plaintext = vec![0u8; max_plaintext];
+    let encrypted = crate::crypto::encrypt(&key, &plaintext).unwrap();
+    assert_eq!(encrypted.len(), CRED_MAX_CREDENTIAL_BLOB_SIZE as usize);
+}
+
+#[test]
+fn test_crypto_decrypt_invalid_magic_fails() {
+    let key: [u8; 32] = [0x66; 32];
+    let blob = b"NOT_ENCRYPTED_DATA_WITH_ENOUGH_LENGTH_FOR_THE_CHECK";
+    let result = crate::crypto::decrypt(&key, blob);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_crypto_decrypt_too_short_fails() {
+    let key: [u8; 32] = [0x77; 32];
+    let blob = b"KRB\x01short";
+    let result = crate::crypto::decrypt(&key, blob);
+    assert!(result.is_err());
+}
+
+#[test]
+#[ignore]
+fn test_ngc_encrypted_round_trip_password() {
+    SET_STORE.call_once(usually_goes_in_main);
+    let name = generate_random_string();
+    let modifiers = HashMap::from([("require-biometric", "true")]);
+    let entry = entry_new_with_modifiers(&name, &name, &modifiers);
+    entry
+        .set_password("ngc-protected-password")
+        .expect("set_password with NGC should succeed");
+
+    let attrs = entry.get_attributes().unwrap();
+    assert!(attrs["comment"].contains("[keyring:biometric]"));
+
+    let password = entry
+        .get_password()
+        .expect("get_password with NGC should succeed");
+    assert_eq!(password, "ngc-protected-password");
+
+    entry
+        .delete_credential()
+        .expect("delete_credential should succeed");
+    assert!(matches!(
+        entry.get_password(),
+        Err(Error::NoEntry) | Err(Error::NoStorageAccess(_))
+    ));
+}
+
+#[test]
+#[ignore]
+fn test_ngc_encrypted_round_trip_secret() {
+    SET_STORE.call_once(usually_goes_in_main);
+    let name = generate_random_string();
+    let modifiers = HashMap::from([("require-biometric", "true")]);
+    let entry = entry_new_with_modifiers(&name, &name, &modifiers);
+    let secret = generate_random_bytes();
+
+    entry
+        .set_secret(&secret)
+        .expect("set_secret with NGC should succeed");
+
+    let out_secret = entry
+        .get_secret()
+        .expect("get_secret with NGC should succeed");
+    assert_eq!(secret, out_secret);
+
+    entry
+        .delete_credential()
+        .expect("delete_credential should succeed");
+}
+
+#[test]
+#[ignore]
+fn test_ngc_update_attributes_no_biometric_prompt() {
+    SET_STORE.call_once(usually_goes_in_main);
+    let name = generate_random_string();
+    let modifiers = HashMap::from([("require-biometric", "true")]);
+    let entry = entry_new_with_modifiers(&name, &name, &modifiers);
+
+    entry.set_password("test").expect("set_password should succeed");
+
+    let in_map: HashMap<&str, &str> = HashMap::from([("target_alias", "test alias")]);
+    entry
+        .update_attributes(&in_map)
+        .expect("update_attributes should not require biometric");
+
+    let attrs = entry.get_attributes().unwrap();
+    assert_eq!(attrs["target_alias"], "test alias");
+
+    entry.delete_credential().unwrap();
+}
+
+#[test]
+fn test_ngc_is_supported_returns_bool() {
+    let _supported = crate::biometric::is_ngc_supported();
+}

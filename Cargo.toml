@@ -13,9 +13,17 @@ version = "0.5.1"
 edition = "2024"
 
 [dependencies]
-keyring-core = { version = "0.7.2" }
+aes-gcm = "0.10"
 byteorder = "1.5.0"
+keyring-core = { version = "0.7.2" }
 regex = "1.12.2"
+sha2 = "0.10"
+windows = { version = "0.61", features = [
+    "Security_Credentials",
+    "Security_Credentials_UI",
+    "Security_Cryptography",
+    "Storage_Streams",
+] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
 zeroize = "1.8.2"
 

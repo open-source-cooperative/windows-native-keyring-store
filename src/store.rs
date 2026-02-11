@@ -114,12 +114,18 @@ impl CredentialStoreApi for Store {
         user: &str,
         modifiers: Option<&HashMap<&str, &str>>,
     ) -> Result<Entry> {
-        let mods = parse_attributes(&["target", "persistence"], modifiers)?;
+        let mods = parse_attributes(
+            &["target", "persistence", "*require-biometric"],
+            modifiers,
+        )?;
         let target = mods.get("target").map(|s| s.as_str());
         let persistence = mods
             .get("persistence")
             .map(|s| s.as_str())
             .unwrap_or("Enterprise");
+        let require_biometric = mods
+            .get("require-biometric")
+            .is_some_and(|s| s.eq("true"));
         let cred = Cred::build_from_specifiers(
             target,
             &self.delimiters,
@@ -127,6 +133,7 @@ impl CredentialStoreApi for Store {
             service,
             user,
             persistence.parse()?,
+            require_biometric,
         )?;
         Ok(Entry::new_with_credential(Arc::new(cred)))
     }
