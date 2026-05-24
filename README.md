@@ -8,6 +8,10 @@ This library provides a credential store for use with the [keyring ecosystem](ht
 
 To use this keychain-compatible credential store provider, you must take a dependency on the [keyring-core crate](https://crates.io/crates/keyring-core) and on [this crate](https://crates.io/crates/windows-native-keyring-store). Then you can instantiate a credential store and set it as your default credential store as shown in the [sample program](examples/example.rs) in this crate.
 
+## Features
+
+This crate has one feature, `search`, that is enabled by default. This feature requires the `regex` crate, which has a large footprint (typically over 1MB). If you care about library size and don't need to do credential searches, you can disable default features to shed the `regex` dependency. 
+
 ## Warning
 
 Tests show that operating on the same entry from different threads does not reliably sequence the operations in the same order they are initiated. (For example, setting a password on one thread and then immediately spawning another to get the password returns a `NoEntry` error on the spawned thread.) So be careful not to access the same entry on multiple threads simultaneously.
