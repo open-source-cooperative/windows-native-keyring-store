@@ -9,8 +9,12 @@ rust-version = "1.88"
 exclude = [".github/"]
 readme = "README.md"
 name = "windows-native-keyring-store"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
+
+[features]
+default = ["search"]
+search = ["dep:regex"]
 
 [dependencies]
 keyring-core = { version = "1" }
@@ -25,7 +29,3 @@ sscanf = "0.5"
 
 [package.metadata.docs.rs]
 targets = ["x86_64-pc-windows-msvc"]
-
-[features]
-default = ["search"]
-search = ["dep:regex"]
