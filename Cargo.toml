@@ -15,7 +15,7 @@ edition = "2024"
 [dependencies]
 keyring-core = { version = "1" }
 byteorder = "1"
-regex = "1"
+regex = { version = "1", optional = true }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
 zeroize = "1"
 
@@ -25,3 +25,7 @@ sscanf = "0.5"
 
 [package.metadata.docs.rs]
 targets = ["x86_64-pc-windows-msvc"]
+
+[features]
+default = ["search"]
+search = ["dep:regex"]

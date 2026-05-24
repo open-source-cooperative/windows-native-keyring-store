@@ -4,10 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use keyring_core::api::{CredentialPersistence, CredentialStoreApi};
 use keyring_core::attributes::parse_attributes;
-use keyring_core::{Entry, Error, Result};
+use keyring_core::{Entry, Result};
 
 use crate::cred::Cred;
-use crate::utils::enumerate_credentials;
 
 /// The store for Windows native credentials
 #[derive(Clone)]
@@ -132,7 +131,11 @@ impl CredentialStoreApi for Store {
     }
 
     /// See the keyring-core API docs.
+    #[cfg(feature = "search")]
     fn search(&self, spec: &HashMap<&str, &str>) -> Result<Vec<Entry>> {
+        use crate::utils::enumerate_credentials;
+        use keyring_core::Error;
+
         let spec = parse_attributes(&["pattern"], Some(spec))?;
         let expr = if let Some(val) = spec.get("pattern") {
             if let Ok(pat) = regex::Regex::new(val) {

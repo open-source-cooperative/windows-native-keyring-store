@@ -6,14 +6,17 @@ use windows_sys::Win32::Foundation::{
     ERROR_BAD_USERNAME, ERROR_INVALID_FLAGS, ERROR_INVALID_PARAMETER, ERROR_NO_SUCH_LOGON_SESSION,
     ERROR_NOT_FOUND, FILETIME, GetLastError,
 };
+#[cfg(feature = "search")]
+use windows_sys::Win32::Security::Credentials::CredEnumerateW;
 use windows_sys::Win32::Security::Credentials::{
     CRED_FLAGS, CRED_MAX_CREDENTIAL_BLOB_SIZE, CRED_MAX_GENERIC_TARGET_NAME_LENGTH,
     CRED_MAX_STRING_LENGTH, CRED_MAX_USERNAME_LENGTH, CRED_PERSIST, CRED_PERSIST_ENTERPRISE,
     CRED_PERSIST_LOCAL_MACHINE, CRED_PERSIST_SESSION, CRED_TYPE_GENERIC, CREDENTIAL_ATTRIBUTEW,
-    CREDENTIALW, CredDeleteW, CredEnumerateW, CredFree, CredReadW, CredWriteW,
+    CREDENTIALW, CredDeleteW, CredFree, CredReadW, CredWriteW,
 };
 use zeroize::Zeroize;
 
+#[cfg(feature = "search")]
 use crate::cred::Cred;
 use keyring_core::error::{Error, Result};
 
@@ -182,6 +185,7 @@ pub fn delete_credential(target_name: &str) -> Result<()> {
 }
 
 /// Enumerate generic credentials
+#[cfg(feature = "search")]
 pub fn enumerate_credentials(
     pattern: Option<regex::Regex>,
     delimiters: &[String; 3],
@@ -251,6 +255,7 @@ where
 }
 
 /// get a Cred from a native credential
+#[cfg(feature = "search")]
 pub fn cred_from_credential(credential: &mut CREDENTIALW) -> Cred {
     erase_secret(credential); // erase the secret, so it won't be leaked into the heap
     let persistence = match credential.Persist {
