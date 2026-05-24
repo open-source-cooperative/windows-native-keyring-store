@@ -4,7 +4,6 @@ use std::sync::{Arc, Once};
 use crate::Store;
 use crate::cred::Cred;
 use crate::utils::{validate_attributes, validate_target};
-use keyring_core::api::CredentialApi;
 use keyring_core::{CredentialStore, Entry, Error, api::CredentialPersistence, get_default_store};
 use windows_sys::Win32::Security::Credentials::{
     CRED_MAX_GENERIC_TARGET_NAME_LENGTH, CRED_MAX_STRING_LENGTH, CRED_MAX_USERNAME_LENGTH,
@@ -457,8 +456,11 @@ fn test_credential_persistence() {
     default.delete_credential().unwrap();
 }
 
+#[cfg(feature = "search")]
 #[test]
 fn test_search() {
+    use keyring_core::api::CredentialApi;
+
     let name = generate_random_string();
     let entry = entry_new("search entry", &name);
     entry.set_password("test search entry").unwrap();

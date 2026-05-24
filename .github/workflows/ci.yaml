@@ -25,6 +25,9 @@ jobs:
       - name: Build and Test
         run: cargo test --verbose -- --test-threads 1
 
+      - name: Build and Test without default features
+        run: cargo test --no-default-features --verbose -- --test-threads 1
+        
       - name: Build examples
         run: cargo build --examples --verbose
 
