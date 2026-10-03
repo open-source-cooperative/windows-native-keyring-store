@@ -1,0 +1,6 @@
+exclude_re = [
+    # Decided only by whether a platform authenticator is present.
+    "src/hello\\.rs:.*: replace capability -> .*Result<\\(\\), SealError> with Ok\\(\\(\\)\\)$",
+    "src/hello_native\\.rs:.*: replace available -> .*Result<\\(\\), SealError> with Ok\\(\\(\\)\\)$",
+    "src/hello_native\\.rs:.*: replace select_hello_authenticator -> .*Result<Vec<u8>, SealError> with Ok\\(vec!\\[[01]?\\]\\)$",
+]

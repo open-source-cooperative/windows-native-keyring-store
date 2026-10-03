@@ -508,20 +508,20 @@ fn to_wstr_no_null(s: &str) -> Vec<u16> {
 
 /// Reads a NUL-terminated wide string, returning an empty string for null.
 ///
+/// WebAuthn packs strings after odd-length byte arrays, so `ws` may be unaligned.
+///
 /// # Safety
 /// `ws` must be null or point to a NUL-terminated UTF-16 string valid for the call.
 pub(crate) unsafe fn from_wstr(ws: *const u16) -> String {
-    // null pointer case, return empty string
     if ws.is_null() {
         return String::new();
     }
-    // this code from https://stackoverflow.com/a/48587463/558006
-    let len = (0..).take_while(|&i| unsafe { *ws.offset(i) != 0 }).count();
-    if len == 0 {
-        return String::new();
-    }
-    let slice = unsafe { std::slice::from_raw_parts(ws, len) };
-    String::from_utf16_lossy(slice)
+    let units: Vec<u16> = (0..)
+        // SAFETY: the caller guarantees the string is NUL-terminated, so reads stop in bounds.
+        .map(|at| unsafe { ws.add(at).read_unaligned() })
+        .take_while(|&unit| unit != 0)
+        .collect();
+    String::from_utf16_lossy(&units)
 }
 
 /// Windows error codes are `DWORDS` which are 32-bit unsigned ints.

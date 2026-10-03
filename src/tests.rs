@@ -519,3 +519,17 @@ fn ordinary_binary_secret_with_protected_prefix_remains_readable() {
     ));
     entry.delete_credential().unwrap();
 }
+
+#[test]
+fn wide_string_decoding_accepts_an_odd_address() {
+    let units: Vec<u16> = "Windows Hello".encode_utf16().chain([0]).collect();
+    let mut bytes = vec![0u8; units.len() * 2 + 1];
+    let start = 1 - bytes.as_ptr() as usize % 2;
+    for (at, unit) in units.iter().enumerate() {
+        bytes[start + 2 * at..start + 2 * at + 2].copy_from_slice(&unit.to_ne_bytes());
+    }
+    let string = bytes[start..].as_ptr().cast::<u16>();
+    assert_eq!(string as usize % 2, 1);
+    // SAFETY: `string` points to a NUL-terminated UTF-16 string inside `bytes`.
+    assert_eq!(unsafe { crate::utils::from_wstr(string) }, "Windows Hello");
+}

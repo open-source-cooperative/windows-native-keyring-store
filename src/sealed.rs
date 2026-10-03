@@ -23,8 +23,8 @@ use crate::utils::{
 /// Why a sealed store refused an operation.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum SealError {
-    /// The store holds no key, so sealed entries cannot be read or written.
-    #[error("sealed store is locked")]
+    /// The store holds no key, or the Windows Hello authenticator is locked.
+    #[error("sealed store or its authenticator is locked")]
     Locked,
     /// The key does not open this store's keycheck record.
     #[error("key does not open this sealed store")]
@@ -44,13 +44,22 @@ pub enum SealError {
     /// This handle predates a finished discard, so the store must be opened again.
     #[error("sealed store was discarded")]
     Discarded,
+    /// This machine lacks what the store needs, such as WebAuthn API 9 or Windows Hello.
+    #[error("sealed store is unsupported here ({0})")]
+    Unsupported(String),
+    /// The platform reports an ambiguous state the store refuses to guess about.
+    #[error("sealed store found a conflict ({0})")]
+    Conflict(String),
 }
 
 impl From<SealError> for Error {
     fn from(error: SealError) -> Self {
         match error {
             SealError::Corrupt(reason) => Error::BadStoreFormat(reason),
-            SealError::Platform(_) => Error::PlatformFailure(Box::new(error)),
+            SealError::Unsupported(reason) => Error::NotSupportedByStore(reason),
+            SealError::Platform(_) | SealError::Conflict(_) => {
+                Error::PlatformFailure(Box::new(error))
+            }
             _ => Error::NoStorageAccess(Box::new(error)),
         }
     }
