@@ -89,9 +89,9 @@ entry.set_password("refresh-token")?;
 assert_eq!(entry.get_password()?, "refresh-token");
 store.lock();
 assert!(entry.get_password().is_err());
-entry.delete_credential()?;
-# let keycheck = format!("{}keycheck", store.id());
-# let target = std::collections::HashMap::from([("target", keycheck.as_str())]);
+store.discard(std::time::Duration::from_secs(10))?;
+# let control = format!("{}control", store.id());
+# let target = std::collections::HashMap::from([("target", control.as_str())]);
 # windows_native_keyring_store::Store::new()?.build("ignored", "ignored", Some(&target))?.delete_credential()?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -119,6 +119,8 @@ threads.
 
 pub mod cred;
 pub use cred::CredPersist;
+#[cfg(test)]
+mod pause;
 pub mod sealed;
 pub use sealed::{Protection, SealError};
 mod sealed_crypto;
