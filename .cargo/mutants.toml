@@ -2,4 +2,8 @@ exclude_re = [
     # Frees the one-time allocations of entering a user's lock namespace, which no behavior observes.
     "src/user_lock\\.rs:.*: replace <impl Drop for LocalMemory>::drop with \\(\\)$",
     "src/user_lock\\.rs:.*: replace <impl Drop for Boundary>::drop with \\(\\)$",
+    # Decided only by whether a platform authenticator is present.
+    "src/hello\\.rs:.*: replace capability -> .*Result<\\(\\), SealError> with Ok\\(\\(\\)\\)$",
+    "src/hello_native\\.rs:.*: replace available -> .*Result<\\(\\), SealError> with Ok\\(\\(\\)\\)$",
+    "src/hello_native\\.rs:.*: replace select_hello_authenticator -> .*Result<Vec<u8>, SealError> with Ok\\(vec!\\[[01]?\\]\\)$",
 ]

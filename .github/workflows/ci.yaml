@@ -49,6 +49,12 @@ jobs:
       - name: Build examples
         run: cargo build --examples --verbose
 
+      - name: Regenerate WebAuthn bindings
+        run: cargo run --manifest-path tools/webauthn-bindings/Cargo.toml
+
+      - name: Check WebAuthn bindings are current
+        run: git diff --exit-code -- src/webauthn.rs
+
   ci_msrv:
     runs-on: windows-latest
 
