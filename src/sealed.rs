@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use keyring_core::attributes::parse_attributes;
 use keyring_core::{Entry, Error, Result};
@@ -12,11 +13,11 @@ use zeroize::Zeroizing;
 
 use crate::cred::Cred;
 use crate::sealed_crypto::{PROTECTED_OVERHEAD, check_layout, is_protected, open, seal};
-use crate::sealed_lock::lock_target;
+use crate::sealed_lock::{lock_target, lock_target_with_timeout};
 use crate::utils::{
-    CredPersist, FoldedName, extract_attributes, extract_from_credential, extract_secret, hex,
-    save_credential, save_spelled_credential, validate_attributes, validate_secret,
-    validate_spelling, validate_target,
+    CredPersist, FoldedName, delete_credential, extract_attributes, extract_from_credential,
+    extract_secret, hex, save_credential, save_spelled_credential, validate_attributes,
+    validate_secret, validate_spelling, validate_target,
 };
 
 /// Why a sealed store refused an operation.
@@ -37,6 +38,12 @@ pub enum SealError {
     /// Another process held the store's lock for too long.
     #[error("sealed store lock timed out")]
     TimedOut,
+    /// A discard of this store started and has not finished.
+    #[error("sealed store discard is incomplete")]
+    Discarding,
+    /// This handle predates a finished discard, so the store must be opened again.
+    #[error("sealed store was discarded")]
+    Discarded,
 }
 
 impl From<SealError> for Error {
@@ -67,10 +74,19 @@ pub enum Protection {
 
 pub(crate) const MAX_PROTECTED_PLAINTEXT: usize =
     CRED_MAX_CREDENTIAL_BLOB_SIZE as usize - PROTECTED_OVERHEAD;
+pub(crate) const CONTROL_MAGIC: &[u8; 5] = b"SCTL1";
+
+/// The store's discard state, which retires every handle that saw another generation.
+#[derive(Clone, Copy)]
+struct Control {
+    discarding: bool,
+    generation: [u8; 16],
+}
 
 /// Scoped targets, keycheck and key of one sealed store, shared by its entries.
 pub(crate) struct Gate {
     prefix: String,
+    generation: Option<[u8; 16]>,
     key: Mutex<Option<Zeroizing<[u8; 32]>>>,
 }
 
@@ -94,8 +110,15 @@ impl Gate {
             prefix += &format!("{:x}:{}:", identifier.len(), hex(identifier.as_bytes()));
         }
         validate_target(&format!("{prefix}keycheck"), "")?;
+        let generation = match read_control(&format!("{prefix}control")) {
+            Ok(control) => control.map(|control| control.generation),
+            // An unreadable record opens blocked, so only `discard` can proceed.
+            Err(SealError::Corrupt(_)) => None,
+            Err(error) => return Err(error.into()),
+        };
         Ok(Arc::new(Self {
             prefix,
+            generation,
             key: Mutex::new(None),
         }))
     }
@@ -163,6 +186,34 @@ impl Gate {
         format!("{}keycheck", self.prefix)
     }
 
+    fn control_target(&self) -> String {
+        format!("{}control", self.prefix)
+    }
+
+    fn check_control(&self) -> SealResult<()> {
+        let control = match read_control(&self.control_target()) {
+            Ok(control) => control,
+            Err(SealError::Corrupt(_)) => return Err(SealError::Discarding),
+            Err(error) => return Err(error),
+        };
+        match control {
+            Some(control) if control.discarding => Err(SealError::Discarding),
+            Some(control) if Some(control.generation) == self.generation => Ok(()),
+            None if self.generation.is_none() => Ok(()),
+            _ => Err(SealError::Discarded),
+        }
+    }
+
+    // Discard writes its marker under the same lock, so a passed check holds for `action`.
+    fn guarded<T, E: From<SealError>>(
+        &self,
+        action: impl FnOnce() -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        let _store = lock_target(&self.control_target())?;
+        self.check_control()?;
+        action()
+    }
+
     /// Erases the key, so entries stay sealed until the next unlock.
     pub(crate) fn lock(&self) {
         *unpoison(self.key.lock()) = None;
@@ -170,28 +221,84 @@ impl Gate {
 
     /// Verifies `key` against the keycheck record, writing it for a new store, then holds it.
     pub(crate) fn unlock(&self, key: &[u8; 32]) -> SealResult<()> {
-        let keycheck = self.keycheck_target();
-        let _keycheck_lock = lock_target(&keycheck)?;
-        match read_raw(&keycheck)? {
-            Some(blob) if !is_protected(&blob) => {
-                return Err(SealError::Corrupt("keycheck record is unsealed".into()));
+        self.guarded(|| {
+            let keycheck = self.keycheck_target();
+            match read_raw(&keycheck)? {
+                Some(blob) if !is_protected(&blob) => {
+                    return Err(SealError::Corrupt("keycheck record is unsealed".into()));
+                }
+                Some(blob) => {
+                    // Only an authentication failure on a well-formed record means another key.
+                    check_layout(&blob)?;
+                    open(key, &self.prefix, &keycheck, &blob).map_err(|_| SealError::WrongKey)?;
+                }
+                None if self.has_scoped_entries()? => {
+                    return Err(SealError::Corrupt("keycheck record is missing".into()));
+                }
+                None => {
+                    let sealed = seal(key, &self.prefix, &keycheck, &[])?;
+                    save_credential(&keycheck, "", "", "", &sealed, &CredPersist::Local)
+                        .map_err(platform)?;
+                }
             }
-            Some(blob) => {
-                // Only an authentication failure on a well-formed record means another key.
-                check_layout(&blob)?;
-                open(key, &self.prefix, &keycheck, &blob).map_err(|_| SealError::WrongKey)?;
-            }
-            None if self.has_scoped_entries()? => {
-                return Err(SealError::Corrupt("keycheck record is missing".into()));
-            }
-            None => {
-                let sealed = seal(key, &self.prefix, &keycheck, &[])?;
-                save_credential(&keycheck, "", "", "", &sealed, &CredPersist::Local)
-                    .map_err(platform)?;
-            }
+            *unpoison(self.key.lock()) = Some(Zeroizing::new(*key));
+            Ok(())
+        })
+    }
+
+    /// Deletes every entry and the keycheck, retiring all existing handles of this store.
+    pub(crate) fn discard(&self, timeout: Duration) -> SealResult<()> {
+        #[cfg(test)]
+        crate::pause::reached(&self.prefix, "discard.entered")?;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(SealError::TimedOut)?;
+        // One transaction, so no discarder or writer acts between the marker and the new generation.
+        let _store = lock_target_with_timeout(&self.control_target(), remaining(deadline))?;
+        self.mark_discarding()?;
+        self.lock();
+        #[cfg(test)]
+        crate::pause::reached(&self.prefix, "discard.deleting")?;
+        for target in self.scoped_targets()? {
+            delete_owned(&target)?;
         }
-        *unpoison(self.key.lock()) = Some(Zeroizing::new(*key));
-        Ok(())
+        delete_owned(&self.keycheck_target())?;
+        self.publish_generation()
+    }
+
+    /// Persists the discard marker, or keeps an interrupted one, under the caller's control lock.
+    fn mark_discarding(&self) -> SealResult<()> {
+        let control_target = self.control_target();
+        let marker = match read_control(&control_target) {
+            Ok(Some(control)) if control.discarding => return Ok(()),
+            Ok(Some(control)) if Some(control.generation) == self.generation => Control {
+                discarding: true,
+                ..control
+            },
+            Ok(None) if self.generation.is_none() => Control {
+                discarding: true,
+                generation: random_generation()?,
+            },
+            // An unreadable record is an interrupted discard that any handle may resume.
+            Err(SealError::Corrupt(_)) => Control {
+                discarding: true,
+                generation: random_generation()?,
+            },
+            Ok(_) => return Err(SealError::Discarded),
+            Err(error) => return Err(error),
+        };
+        save_control(&control_target, &marker)
+    }
+
+    /// Ends a discard with a fresh generation, under the caller's control lock.
+    fn publish_generation(&self) -> SealResult<()> {
+        save_control(
+            &self.control_target(),
+            &Control {
+                discarding: false,
+                generation: random_generation()?,
+            },
+        )
     }
 
     fn scoped_targets(&self) -> SealResult<Vec<String>> {
@@ -236,8 +343,10 @@ impl Gate {
     }
 
     fn with_key<T>(&self, action: impl FnOnce(&[u8; 32]) -> Result<T>) -> Result<T> {
-        let key = unpoison(self.key.lock());
-        action(key.as_ref().ok_or(SealError::Locked)?)
+        self.guarded(|| {
+            let key = unpoison(self.key.lock());
+            action(key.as_ref().ok_or(SealError::Locked)?)
+        })
     }
 
     /// Opens the sealed secret of `target`, refusing an unsealed record.
@@ -308,6 +417,26 @@ impl Gate {
             extract_from_credential(target, extract_attributes)
         })
     }
+
+    /// Deletes the entry without its key, so a locked store can still remove it.
+    pub(crate) fn delete(&self, target: &str) -> Result<()> {
+        self.guarded(|| delete_credential(target))
+    }
+}
+
+#[cfg(test)]
+impl Gate {
+    /// Panics unless this gate of a fresh store takes its control lock and passes its control
+    /// check, so a test built on a broken gate fails at once instead of waiting out its bounds.
+    pub(crate) fn assert_usable(&self) {
+        let control = self.control_target();
+        assert!(
+            control.starts_with(&self.prefix),
+            "the control record {control:?} escapes the store prefix"
+        );
+        drop(lock_target_with_timeout(&control, Duration::from_secs(2)).expect("the control lock"));
+        assert_eq!(self.check_control(), Ok(()));
+    }
 }
 
 /// A listed name is one of the store's scoped targets exactly when its folded form is ASCII
@@ -333,6 +462,52 @@ fn read_raw(target: &str) -> SealResult<Option<Zeroizing<Vec<u8>>>> {
 
 fn platform(error: impl std::fmt::Display) -> SealError {
     SealError::Platform(error.to_string())
+}
+
+fn remaining(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+fn read_control(target: &str) -> SealResult<Option<Control>> {
+    let Some(blob) = read_raw(target)? else {
+        return Ok(None);
+    };
+    let (Some(magic), Some(&state), Some(generation)) = (blob.get(..5), blob.get(5), blob.get(6..))
+    else {
+        return Err(SealError::Corrupt("invalid store control record".into()));
+    };
+    let discarding = match state {
+        0 => false,
+        1 => true,
+        _ => return Err(SealError::Corrupt("invalid store control state".into())),
+    };
+    match (magic == CONTROL_MAGIC, <[u8; 16]>::try_from(generation)) {
+        (true, Ok(generation)) => Ok(Some(Control {
+            discarding,
+            generation,
+        })),
+        _ => Err(SealError::Corrupt("invalid store control record".into())),
+    }
+}
+
+fn save_control(target: &str, control: &Control) -> SealResult<()> {
+    let mut bytes = CONTROL_MAGIC.to_vec();
+    bytes.push(u8::from(control.discarding));
+    bytes.extend_from_slice(&control.generation);
+    save_credential(target, "", "", "", &bytes, &CredPersist::Local).map_err(platform)
+}
+
+fn random_generation() -> SealResult<[u8; 16]> {
+    let mut generation = [0; 16];
+    getrandom::fill(&mut generation).map_err(platform)?;
+    Ok(generation)
+}
+
+fn delete_owned(target: &str) -> SealResult<()> {
+    match delete_credential(target) {
+        Ok(()) | Err(Error::NoEntry) => Ok(()),
+        Err(error) => Err(platform(error)),
+    }
 }
 
 pub(crate) fn validate_protected_plaintext(secret: &[u8]) -> Result<()> {
