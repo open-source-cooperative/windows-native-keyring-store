@@ -34,6 +34,11 @@ unsafe extern "system" {
         ppwebauthncredentialattestation: *mut PWEBAUTHN_CREDENTIAL_ATTESTATION,
     ) -> HRESULT;
 }
+pub type WebAuthNCancelCurrentOperation =
+    unsafe extern "system" fn(pcancellationid: *const GUID) -> HRESULT;
+unsafe extern "system" {
+    pub fn WebAuthNCancelCurrentOperation(pcancellationid: *const GUID) -> HRESULT;
+}
 pub type WebAuthNDeletePlatformCredential =
     unsafe extern "system" fn(cbcredentialid: u32, pbcredentialid: *const u8) -> HRESULT;
 unsafe extern "system" {
@@ -42,12 +47,25 @@ unsafe extern "system" {
         pbcredentialid: *const u8,
     ) -> HRESULT;
 }
+pub type WebAuthNFreeAssertion =
+    unsafe extern "system" fn(pwebauthnassertion: *const WEBAUTHN_ASSERTION);
+unsafe extern "system" {
+    pub fn WebAuthNFreeAssertion(pwebauthnassertion: *const WEBAUTHN_ASSERTION);
+}
 pub type WebAuthNFreeAuthenticatorList = unsafe extern "system" fn(
     pauthenticatordetailslist: *const WEBAUTHN_AUTHENTICATOR_DETAILS_LIST,
 );
 unsafe extern "system" {
     pub fn WebAuthNFreeAuthenticatorList(
         pauthenticatordetailslist: *const WEBAUTHN_AUTHENTICATOR_DETAILS_LIST,
+    );
+}
+pub type WebAuthNFreeCredentialAttestation = unsafe extern "system" fn(
+    pwebauthncredentialattestation: *const WEBAUTHN_CREDENTIAL_ATTESTATION,
+);
+unsafe extern "system" {
+    pub fn WebAuthNFreeCredentialAttestation(
+        pwebauthncredentialattestation: *const WEBAUTHN_CREDENTIAL_ATTESTATION,
     );
 }
 pub type WebAuthNFreePlatformCredentialList =
@@ -70,6 +88,11 @@ unsafe extern "system" {
         pwebauthngetauthenticatorlistoptions: *const WEBAUTHN_AUTHENTICATOR_DETAILS_OPTIONS,
         ppauthenticatordetailslist: *mut PWEBAUTHN_AUTHENTICATOR_DETAILS_LIST,
     ) -> HRESULT;
+}
+pub type WebAuthNGetCancellationId =
+    unsafe extern "system" fn(pcancellationid: *mut GUID) -> HRESULT;
+unsafe extern "system" {
+    pub fn WebAuthNGetCancellationId(pcancellationid: *mut GUID) -> HRESULT;
 }
 pub type WebAuthNGetErrorName = unsafe extern "system" fn(hr: HRESULT) -> PCWSTR;
 unsafe extern "system" {
@@ -139,6 +162,7 @@ pub type PWEBAUTHN_HMAC_SECRET_SALT = *mut WEBAUTHN_HMAC_SECRET_SALT;
 pub type PWEBAUTHN_HMAC_SECRET_SALT_VALUES = *mut WEBAUTHN_HMAC_SECRET_SALT_VALUES;
 pub type PWEBAUTHN_RP_ENTITY_INFORMATION = *mut WEBAUTHN_RP_ENTITY_INFORMATION;
 pub type PWEBAUTHN_USER_ENTITY_INFORMATION = *mut WEBAUTHN_USER_ENTITY_INFORMATION;
+pub type HSTRING = *mut core::ffi::c_void;
 pub const WEBAUTHN_API_VERSION_9: i32 = 9;
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -165,6 +189,8 @@ pub struct WEBAUTHN_ASSERTION {
     pub pbAuthenticationResponseJSON: PBYTE,
 }
 pub const WEBAUTHN_ASSERTION_VERSION_6: i32 = 6;
+pub const WEBAUTHN_ATTESTATION_CONVEYANCE_PREFERENCE_NONE: i32 = 1;
+pub const WEBAUTHN_AUTHENTICATOR_ATTACHMENT_PLATFORM: i32 = 1;
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct WEBAUTHN_AUTHENTICATOR_DETAILS {
@@ -219,6 +245,8 @@ pub struct WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS {
     pub cbAuthenticatorId: u32,
     pub pbAuthenticatorId: PBYTE,
 }
+pub const WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_CURRENT_VERSION: i32 = 9;
+pub const WEBAUTHN_AUTHENTICATOR_HMAC_SECRET_VALUES_FLAG: i32 = 1048576;
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS {
@@ -251,6 +279,7 @@ pub struct WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS {
     pub cbAuthenticatorId: u32,
     pub pbAuthenticatorId: PBYTE,
 }
+pub const WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS_CURRENT_VERSION: i32 = 9;
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct WEBAUTHN_CLIENT_DATA {
@@ -355,6 +384,8 @@ pub struct WEBAUTHN_CREDENTIAL_LIST {
     pub cCredentials: u32,
     pub ppCredentials: *mut PWEBAUTHN_CREDENTIAL_EX,
 }
+pub const WEBAUTHN_CREDENTIAL_TYPE_PUBLIC_KEY: PCWSTR =
+    [112, 117, 98, 108, 105, 99, 45, 107, 101, 121, 0].as_ptr();
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct WEBAUTHN_CRED_WITH_HMAC_SECRET_SALT {
@@ -384,6 +415,7 @@ pub struct WEBAUTHN_GET_CREDENTIALS_OPTIONS {
     pub pwszRpId: PCWSTR,
     pub bBrowserInPrivateMode: BOOL,
 }
+pub const WEBAUTHN_HASH_ALGORITHM_SHA_256: PCWSTR = [83, 72, 65, 45, 50, 53, 54, 0].as_ptr();
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct WEBAUTHN_HMAC_SECRET_SALT {
@@ -417,3 +449,4 @@ pub struct WEBAUTHN_USER_ENTITY_INFORMATION {
     pub pwszIcon: PCWSTR,
     pub pwszDisplayName: PCWSTR,
 }
+pub const WEBAUTHN_USER_VERIFICATION_REQUIREMENT_REQUIRED: i32 = 1;

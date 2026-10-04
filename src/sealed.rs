@@ -50,6 +50,15 @@ pub enum SealError {
     /// The platform reports an ambiguous state the store refuses to guess about.
     #[error("sealed store found a conflict ({0})")]
     Conflict(String),
+    /// The window meant to own the Windows Hello prompt is missing or no longer live.
+    #[error("Windows Hello owner window is missing or no longer live")]
+    MissingOwner,
+    /// The caller cancelled, or `lock` revoked, a Windows Hello request.
+    #[error("Windows Hello request was cancelled")]
+    Cancelled,
+    /// The store's Windows Hello passkey is gone or no longer matches its entries.
+    #[error("Windows Hello credential for this store was lost")]
+    KeyLost,
 }
 
 impl From<SealError> for Error {
