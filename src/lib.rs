@@ -82,9 +82,11 @@ the application supplies, binding it to its store and target:
 use keyring_core::api::CredentialStoreApi;
 use windows_native_keyring_store::SealedStore;
 
-let store = SealedStore::new("example-app", "tokens")?;
+let service = "example-app";
+# let service = &format!("example-app-{}", std::process::id());
+let store = SealedStore::new(service, "tokens")?;
 store.unlock(&[7; 32])?;
-let entry = store.build("example-app", "alice", None)?;
+let entry = store.build(service, "alice", None)?;
 entry.set_password("refresh-token")?;
 assert_eq!(entry.get_password()?, "refresh-token");
 store.lock();
@@ -100,6 +102,11 @@ Entries are scoped to their store and always have [Local](CredPersist::Local) pe
 Their service and user match without regard to case, the way Credential Manager matches the
 targets of a plain [Store]. They can be read and written only while the store is unlocked
 but deleted at any time, and a plain [Store] refuses to read a sealed secret as a password.
+
+An entry that a plain [Store] holds under the same service and user moves into the store
+on first access after unlock, and deleting the sealed entry deletes it too. Windows cannot
+delete a credential only if it is unchanged, so stop other writers of the plain entry
+while it migrates.
 
 ## Windows Hello
 

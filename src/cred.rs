@@ -152,7 +152,7 @@ impl CredentialApi for Cred {
     /// See the keyring-core API docs.
     fn get_secret(&self) -> Result<Vec<u8>> {
         if let Some(sealed) = &self.sealed {
-            return sealed.gate.get_secret(&self.target_name);
+            return sealed.gate.get_secret(&self.target_name, &sealed.spelling);
         }
         extract_from_credential(&self.target_name, extract_secret)
     }
@@ -160,7 +160,7 @@ impl CredentialApi for Cred {
     /// See the keyring-core API docs.
     fn get_attributes(&self) -> Result<HashMap<String, String>> {
         if let Some(sealed) = &self.sealed {
-            return sealed.gate.attributes(&self.target_name);
+            return sealed.gate.attributes(&self.target_name, &sealed.spelling);
         }
         extract_from_credential(&self.target_name, extract_attributes)
     }
