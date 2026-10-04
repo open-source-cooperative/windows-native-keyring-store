@@ -90,6 +90,8 @@ threads.
 
 pub mod cred;
 pub use cred::CredPersist;
+mod sealed;
+mod sealed_crypto;
 pub mod store;
 pub use store::Store;
 #[cfg(test)]
