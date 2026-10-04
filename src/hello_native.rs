@@ -2,7 +2,6 @@
 //!
 //! The DLL is loaded at run time from System32 only, so a machine without WebAuthn API 9
 //! reports [`SealError::Unsupported`] instead of failing to start.
-#![expect(dead_code, reason = "called by HelloStore")]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};

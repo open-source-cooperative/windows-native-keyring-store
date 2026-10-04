@@ -5,7 +5,7 @@ use std::time::Duration;
 use keyring_core::api::{CredentialPersistence, CredentialStoreApi};
 use keyring_core::{Entry, Result};
 
-use crate::sealed::{Gate, Protection, SealError};
+use crate::sealed::{Gate, Kind, Protection, SealError};
 
 /// A named store whose entries are sealed under a key the application supplies.
 ///
@@ -18,7 +18,7 @@ pub struct SealedStore {
 impl SealedStore {
     /// Create the store named `store` for `application`, starting locked.
     pub fn new(application: &str, store: &str) -> Result<Arc<Self>> {
-        let gate = Gate::new(application, store)?;
+        let gate = Gate::new(Kind::Sealed, application, store)?;
         Ok(Arc::new(Self {
             id: gate.id(),
             gate,
