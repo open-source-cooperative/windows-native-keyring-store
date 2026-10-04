@@ -1,5 +1,4 @@
 //! Cross-process locks for sealed store records, isolated to the current Windows user.
-#![expect(dead_code, reason = "lock_target is called by Gate")]
 
 use std::sync::Mutex;
 use std::time::Duration;

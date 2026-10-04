@@ -72,6 +72,35 @@ have its own conventions for delimiters used when forming the `target_name`.
 Thus, a search in one store may return a wrapper/specifier for an existing credential
 but that same search in another store may return a wrapper that is *not* a specifier.
 
+## Sealed stores
+
+Credential Manager entries are readable by any process running as the user.
+A [SealedStore] instead encrypts each secret with AES-256-GCM under a 32-byte key
+the application supplies, binding it to its store and target:
+
+```
+use keyring_core::api::CredentialStoreApi;
+use windows_native_keyring_store::SealedStore;
+
+let store = SealedStore::new("example-app", "tokens")?;
+store.unlock(&[7; 32])?;
+let entry = store.build("example-app", "alice", None)?;
+entry.set_password("refresh-token")?;
+assert_eq!(entry.get_password()?, "refresh-token");
+store.lock();
+assert!(entry.get_password().is_err());
+entry.delete_credential()?;
+# let keycheck = format!("{}keycheck", store.id());
+# let target = std::collections::HashMap::from([("target", keycheck.as_str())]);
+# windows_native_keyring_store::Store::new()?.build("ignored", "ignored", Some(&target))?.delete_credential()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Entries are scoped to their store and always have [Local](CredPersist::Local) persistence.
+Their service and user match without regard to case, the way Credential Manager matches the
+targets of a plain [Store]. They can be read and written only while the store is unlocked
+but deleted at any time, and a plain [Store] refuses to read a sealed secret as a password.
+
 ## Warnings
 
 Tests show that operating on the same entry from different threads
@@ -90,9 +119,14 @@ threads.
 
 pub mod cred;
 pub use cred::CredPersist;
-mod sealed;
+pub mod sealed;
+pub use sealed::{Protection, SealError};
 mod sealed_crypto;
 mod sealed_lock;
+pub mod sealed_store;
+pub use sealed_store::SealedStore;
+#[cfg(test)]
+mod sealed_tests;
 pub mod store;
 pub use store::Store;
 #[cfg(test)]
