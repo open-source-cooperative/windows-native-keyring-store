@@ -6,22 +6,40 @@
 
 use libloading::Library;
 use libloading::os::windows::{LOAD_LIBRARY_SEARCH_SYSTEM32, Library as WindowsLibrary};
+use zeroize::Zeroizing;
+
+use windows_sys::Win32::Security::Credentials::CRED_MAX_CREDENTIAL_BLOB_SIZE;
 
 use crate::sealed::SealError;
 use crate::utils::from_wstr;
 use crate::webauthn::{
     BOOL, HRESULT, PBYTE, PWEBAUTHN_AUTHENTICATOR_DETAILS_LIST, PWEBAUTHN_CREDENTIAL_DETAILS_LIST,
-    WEBAUTHN_API_VERSION_9, WEBAUTHN_AUTHENTICATOR_DETAILS_LIST,
-    WEBAUTHN_AUTHENTICATOR_DETAILS_OPTIONS, WEBAUTHN_AUTHENTICATOR_DETAILS_OPTIONS_CURRENT_VERSION,
-    WEBAUTHN_GET_CREDENTIALS_OPTIONS, WebAuthNDeletePlatformCredential,
-    WebAuthNFreeAuthenticatorList, WebAuthNFreePlatformCredentialList, WebAuthNGetApiVersionNumber,
-    WebAuthNGetAuthenticatorList, WebAuthNGetErrorName, WebAuthNGetPlatformCredentialList,
+    WEBAUTHN_API_VERSION_9, WEBAUTHN_ASSERTION, WEBAUTHN_ASSERTION_VERSION_6,
+    WEBAUTHN_AUTHENTICATOR_DETAILS_LIST, WEBAUTHN_AUTHENTICATOR_DETAILS_OPTIONS,
+    WEBAUTHN_AUTHENTICATOR_DETAILS_OPTIONS_CURRENT_VERSION, WEBAUTHN_CREDENTIAL_ATTESTATION,
+    WEBAUTHN_CREDENTIAL_ATTESTATION_CURRENT_VERSION, WEBAUTHN_CTAP_ONE_HMAC_SECRET_LENGTH,
+    WEBAUTHN_CTAP_TRANSPORT_INTERNAL, WEBAUTHN_GET_CREDENTIALS_OPTIONS, WEBAUTHN_HMAC_SECRET_SALT,
+    WebAuthNDeletePlatformCredential, WebAuthNFreeAuthenticatorList,
+    WebAuthNFreePlatformCredentialList, WebAuthNGetApiVersionNumber, WebAuthNGetAuthenticatorList,
+    WebAuthNGetErrorName, WebAuthNGetPlatformCredentialList,
     WebAuthNIsUserVerifyingPlatformAuthenticatorAvailable,
 };
 
 const S_OK: HRESULT = 0;
 const NTE_NOT_FOUND: HRESULT = 0x8009_0011u32.cast_signed();
 const HELLO_NAME: &str = "Windows Hello";
+// The mirrored attestation and assertion layouts are versions 8 and 6, which API 9 returns.
+const ATTESTATION_VERSION_MIN: u32 =
+    WEBAUTHN_CREDENTIAL_ATTESTATION_CURRENT_VERSION.cast_unsigned();
+const ASSERTION_VERSION_MIN: u32 = WEBAUTHN_ASSERTION_VERSION_6.cast_unsigned();
+const HMAC_SECRET_LENGTH: u32 = WEBAUTHN_CTAP_ONE_HMAC_SECRET_LENGTH.cast_unsigned();
+const TRANSPORT_INTERNAL: u32 = WEBAUTHN_CTAP_TRANSPORT_INTERNAL.cast_unsigned();
+// authenticator data is 32-byte rpIdHash plus a flags byte plus a counter.
+const AUTHENTICATOR_DATA_HEADER_LEN: u32 = 37;
+const AUTHENTICATOR_DATA_FLAGS_OFFSET: usize = 32;
+const FLAG_USER_PRESENT: u8 = 0x01;
+const FLAG_USER_VERIFIED: u8 = 0x04;
+pub(crate) const MAX_CREDENTIAL_ID: usize = CRED_MAX_CREDENTIAL_BLOB_SIZE as usize - 72;
 
 /// Function pointers copied out of `webauthn.dll`, valid while `_lib` keeps it loaded.
 struct WebAuthn {
@@ -206,6 +224,14 @@ fn delete_verified(api: &WebAuthn, rp_id: &str, ids: &[Vec<u8>]) -> Result<(), S
         ));
     }
     Ok(())
+}
+
+fn prf_salt(salt: &[u8; 32]) -> WEBAUTHN_HMAC_SECRET_SALT {
+    WEBAUTHN_HMAC_SECRET_SALT {
+        cbFirst: HMAC_SECRET_LENGTH,
+        pbFirst: salt.as_ptr().cast_mut(),
+        ..Default::default()
+    }
 }
 
 /// The outcome of the platform-authenticator availability probe.
@@ -449,6 +475,162 @@ fn delete_credential(api: &WebAuthn, credential_id: &[u8]) -> Result<(), SealErr
     }
 }
 
+/// # Safety
+/// `attestation` must point to a native attestation whose `dwVersion` is readable.
+unsafe fn read_attestation(
+    attestation: *const WEBAUTHN_CREDENTIAL_ATTESTATION,
+) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>), SealError> {
+    // SAFETY: every attestation version begins with `dwVersion`, read without a whole-struct
+    // reference.
+    let version = unsafe { (&raw const (*attestation).dwVersion).read_unaligned() };
+    if version < ATTESTATION_VERSION_MIN {
+        return Err(SealError::Corrupt(format!(
+            "attestation version {version} is below the mirrored version {ATTESTATION_VERSION_MIN}"
+        )));
+    }
+    // SAFETY: an attestation of at least the mirrored version carries every field of the
+    // mirrored layout, read field by field.
+    let used_transport = unsafe { (&raw const (*attestation).dwUsedTransport).read_unaligned() };
+    if used_transport & TRANSPORT_INTERNAL == 0 {
+        return Err(SealError::Unsupported(
+            "make credential did not use the internal Windows Hello transport".into(),
+        ));
+    }
+    let transports = unsafe { (&raw const (*attestation).dwTransports).read_unaligned() };
+    if transports & TRANSPORT_INTERNAL == 0 {
+        return Err(SealError::Unsupported(
+            "attestation reports no internal Windows Hello transport".into(),
+        ));
+    }
+    let prf_enabled = unsafe { (&raw const (*attestation).bPrfEnabled).read_unaligned() };
+    if prf_enabled == 0 {
+        return Err(SealError::Unsupported(
+            "Windows Hello credential lacks PRF support".into(),
+        ));
+    }
+    let pb_credential_id = unsafe { (&raw const (*attestation).pbCredentialId).read_unaligned() };
+    let cb_credential_id = unsafe { (&raw const (*attestation).cbCredentialId).read_unaligned() };
+    let credential_id = read_credential_id(pb_credential_id.cast(), cb_credential_id)?;
+    let pb_authenticator_data =
+        unsafe { (&raw const (*attestation).pbAuthenticatorData).read_unaligned() };
+    let cb_authenticator_data =
+        unsafe { (&raw const (*attestation).cbAuthenticatorData).read_unaligned() };
+    check_authenticator_data(pb_authenticator_data.cast(), cb_authenticator_data)?;
+    let hmac_secret = unsafe { (&raw const (*attestation).pHmacSecret).read_unaligned() };
+    let key = read_prf_key(hmac_secret, "make credential")?;
+    Ok((credential_id, key))
+}
+
+/// # Safety
+/// `assertion` must point to a native assertion whose `dwVersion` is readable.
+unsafe fn read_assertion(
+    assertion: *const WEBAUTHN_ASSERTION,
+    requested_id: &[u8],
+) -> Result<Zeroizing<[u8; 32]>, SealError> {
+    // SAFETY: every assertion version begins with `dwVersion`, read without a whole-struct
+    // reference.
+    let version = unsafe { (&raw const (*assertion).dwVersion).read_unaligned() };
+    if version < ASSERTION_VERSION_MIN {
+        return Err(SealError::Corrupt(format!(
+            "assertion version {version} is below the mirrored version {ASSERTION_VERSION_MIN}"
+        )));
+    }
+    // SAFETY: an assertion of at least the mirrored version carries every version-6 field,
+    // read field by field.
+    let used_transport = unsafe { (&raw const (*assertion).dwUsedTransport).read_unaligned() };
+    if used_transport & TRANSPORT_INTERNAL == 0 {
+        return Err(SealError::Unsupported(
+            "get assertion did not use the internal Windows Hello transport".into(),
+        ));
+    }
+    let used_len = unsafe { (&raw const (*assertion).Credential.cbId).read_unaligned() };
+    let used_ptr = unsafe { (&raw const (*assertion).Credential.pbId).read_unaligned() };
+    if used_len as usize != requested_id.len() || used_ptr.is_null() {
+        return Err(SealError::Corrupt(
+            "assertion used a different credential id".into(),
+        ));
+    }
+    // SAFETY: `used_len` equals `requested_id.len()` at this point.
+    let used: &[u8] = unsafe { std::slice::from_raw_parts(used_ptr.cast(), requested_id.len()) };
+    if used != requested_id {
+        return Err(SealError::Corrupt(
+            "assertion used a different credential id".into(),
+        ));
+    }
+    let pb_authenticator_data =
+        unsafe { (&raw const (*assertion).pbAuthenticatorData).read_unaligned() };
+    let cb_authenticator_data =
+        unsafe { (&raw const (*assertion).cbAuthenticatorData).read_unaligned() };
+    check_authenticator_data(pb_authenticator_data.cast(), cb_authenticator_data)?;
+    let hmac_secret = unsafe { (&raw const (*assertion).pHmacSecret).read_unaligned() };
+    read_prf_key(hmac_secret, "get assertion")
+}
+
+fn read_credential_id(ptr: *const u8, len: u32) -> Result<Vec<u8>, SealError> {
+    let length = usize::try_from(len)
+        .map_err(|_| SealError::Corrupt("invalid credential ID length".into()))?;
+    if length == 0 || length > MAX_CREDENTIAL_ID || ptr.is_null() {
+        return Err(SealError::Corrupt(format!(
+            "credential ID length {len} cannot fit enrollment metadata"
+        )));
+    }
+    // SAFETY: length is bounded by the local credential metadata capacity.
+    Ok(unsafe { std::slice::from_raw_parts(ptr, length) }.to_vec())
+}
+
+fn check_authenticator_data(data: *const u8, len: u32) -> Result<(), SealError> {
+    if data.is_null() {
+        return Err(SealError::Corrupt(
+            "authenticator data pointer is null".into(),
+        ));
+    }
+    if len < AUTHENTICATOR_DATA_HEADER_LEN {
+        return Err(SealError::Corrupt(format!(
+            "authenticator data length {len} is below the {AUTHENTICATOR_DATA_HEADER_LEN}-byte header"
+        )));
+    }
+    // SAFETY: the native buffer has at least the fixed header length.
+    let header =
+        unsafe { std::slice::from_raw_parts(data, AUTHENTICATOR_DATA_HEADER_LEN as usize) };
+    let flags = header[AUTHENTICATOR_DATA_FLAGS_OFFSET];
+    if flags & FLAG_USER_PRESENT == 0 {
+        return Err(SealError::Corrupt(
+            "authenticator data lacks the user presence bit".into(),
+        ));
+    }
+    if flags & FLAG_USER_VERIFIED == 0 {
+        return Err(SealError::Corrupt(
+            "authenticator data lacks the user verification bit".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_prf_key(
+    hmac_secret: *const WEBAUTHN_HMAC_SECRET_SALT,
+    operation: &str,
+) -> Result<Zeroizing<[u8; 32]>, SealError> {
+    if hmac_secret.is_null() {
+        return Err(SealError::Unsupported(format!(
+            "{operation} enabled PRF but returned no hmac secret"
+        )));
+    }
+    // SAFETY: a non-null `pHmacSecret` points at the fixed-layout salt value webauthn.dll owns.
+    let salt = unsafe { &*hmac_secret };
+    if salt.cbFirst != HMAC_SECRET_LENGTH || salt.pbFirst.is_null() {
+        return Err(SealError::Unsupported(format!(
+            "{operation} returned an hmac secret of {} bytes instead of {HMAC_SECRET_LENGTH}",
+            salt.cbFirst
+        )));
+    }
+    let mut key = Zeroizing::from([0u8; 32]);
+    // SAFETY: `cbFirst` was checked equal to `HMAC_SECRET_LENGTH`.
+    key.as_mut().copy_from_slice(unsafe {
+        std::slice::from_raw_parts(salt.pbFirst.cast(), HMAC_SECRET_LENGTH as usize)
+    });
+    Ok(key)
+}
+
 /// The name WebAuthn assigns to an error hr, or `unknown` when it assigns none.
 fn hr_error_name(raw: &str) -> &str {
     if raw.is_empty() { "unknown" } else { raw }
@@ -482,9 +664,9 @@ unsafe fn native_entries<'a, T: 'a>(
 mod tests {
     use super::*;
     use crate::webauthn::{
-        PWEBAUTHN_CREDENTIAL_DETAILS, WEBAUTHN_AUTHENTICATOR_DETAILS, WEBAUTHN_CREDENTIAL_DETAILS,
-        WEBAUTHN_CREDENTIAL_DETAILS_LIST, WEBAUTHN_RP_ENTITY_INFORMATION,
-        WEBAUTHN_USER_ENTITY_INFORMATION,
+        PWEBAUTHN_CREDENTIAL_DETAILS, WEBAUTHN_AUTHENTICATOR_DETAILS, WEBAUTHN_CREDENTIAL,
+        WEBAUTHN_CREDENTIAL_DETAILS, WEBAUTHN_CREDENTIAL_DETAILS_LIST,
+        WEBAUTHN_RP_ENTITY_INFORMATION, WEBAUTHN_USER_ENTITY_INFORMATION,
     };
     use getrandom::fill;
 
@@ -581,6 +763,229 @@ mod tests {
             ("Windows Hello", &[6], false),
         ]);
         assert!(matches!(distinct.select(), Err(SealError::Conflict(_))));
+    }
+
+    #[test]
+    fn attestation_without_prf_is_unsupported() {
+        let mut data = [0u8; 164];
+        data[AUTHENTICATOR_DATA_FLAGS_OFFSET] = FLAG_USER_PRESENT | FLAG_USER_VERIFIED;
+        assert!(matches!(
+            test_attestation_with(ATTESTATION_VERSION_MIN, &data, 0),
+            Err(SealError::Unsupported(_))
+        ));
+    }
+
+    const CREDENTIAL_ID: [u8; 32] = [9; 32];
+    const PRF: [u8; 32] = [13; 32];
+
+    fn test_attestation_version(
+        version: u32,
+        data: &[u8],
+    ) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>), SealError> {
+        test_attestation_with(version, data, 1)
+    }
+
+    /// Reads a valid local attestation that differs only in its version, data and PRF flag.
+    fn test_attestation_with(
+        version: u32,
+        data: &[u8],
+        prf_enabled: BOOL,
+    ) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>), SealError> {
+        let mut salt = prf_salt(&PRF);
+        let attestation = WEBAUTHN_CREDENTIAL_ATTESTATION {
+            dwVersion: version,
+            dwUsedTransport: TRANSPORT_INTERNAL,
+            dwTransports: TRANSPORT_INTERNAL,
+            bPrfEnabled: prf_enabled,
+            cbCredentialId: u32::try_from(CREDENTIAL_ID.len()).unwrap(),
+            pbCredentialId: CREDENTIAL_ID.as_ptr().cast_mut(),
+            cbAuthenticatorData: u32::try_from(data.len()).unwrap(),
+            pbAuthenticatorData: data.as_ptr().cast_mut(),
+            pHmacSecret: &mut salt,
+            ..Default::default()
+        };
+        // SAFETY: the fixture is a complete local attestation.
+        unsafe { read_attestation(&attestation) }
+    }
+
+    fn test_attestation(data: &[u8]) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>), SealError> {
+        test_attestation_version(8, data)
+    }
+
+    fn test_assertion_version(version: u32, data: &[u8]) -> Result<Zeroizing<[u8; 32]>, SealError> {
+        let mut salt = prf_salt(&PRF);
+        let assertion = WEBAUTHN_ASSERTION {
+            dwVersion: version,
+            dwUsedTransport: TRANSPORT_INTERNAL,
+            Credential: WEBAUTHN_CREDENTIAL {
+                dwVersion: 1,
+                cbId: u32::try_from(CREDENTIAL_ID.len()).unwrap(),
+                pbId: CREDENTIAL_ID.as_ptr().cast_mut(),
+                pwszCredentialType: std::ptr::null(),
+            },
+            cbAuthenticatorData: u32::try_from(data.len()).unwrap(),
+            pbAuthenticatorData: data.as_ptr().cast_mut(),
+            pHmacSecret: &mut salt,
+            ..Default::default()
+        };
+        // SAFETY: the fixture is a complete local assertion.
+        unsafe { read_assertion(&assertion, &CREDENTIAL_ID) }
+    }
+
+    fn test_assertion(data: &[u8]) -> Result<Zeroizing<[u8; 32]>, SealError> {
+        test_assertion_version(6, data)
+    }
+
+    #[test]
+    fn ceremonies_reject_versions_below_the_mirrored_layouts() {
+        let mut data = [0u8; 164];
+        data[AUTHENTICATOR_DATA_FLAGS_OFFSET] = FLAG_USER_PRESENT | FLAG_USER_VERIFIED;
+        assert!(matches!(
+            test_attestation_version(7, &data),
+            Err(SealError::Corrupt(_))
+        ));
+        assert!(matches!(
+            test_assertion_version(5, &data),
+            Err(SealError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn ceremonies_accept_extended_authenticator_data() {
+        let mut data = [0u8; 164];
+        data[AUTHENTICATOR_DATA_FLAGS_OFFSET] = FLAG_USER_PRESENT | FLAG_USER_VERIFIED;
+        let (credential_id, key) = test_attestation(&data).unwrap();
+        assert_eq!(
+            (credential_id.as_slice(), *key),
+            (CREDENTIAL_ID.as_slice(), PRF)
+        );
+        assert_eq!(*test_assertion(&data[..75]).unwrap(), PRF);
+    }
+
+    #[test]
+    fn authenticator_data_rejects_null_and_short_headers() {
+        let mut short = [0u8; 36];
+        short[AUTHENTICATOR_DATA_FLAGS_OFFSET] = FLAG_USER_PRESENT | FLAG_USER_VERIFIED;
+        for len in [0, short.len() as u32] {
+            assert!(matches!(
+                check_authenticator_data(short.as_ptr(), len),
+                Err(SealError::Corrupt(_))
+            ));
+        }
+        for len in [AUTHENTICATOR_DATA_HEADER_LEN, 164] {
+            assert!(matches!(
+                check_authenticator_data(std::ptr::null(), len),
+                Err(SealError::Corrupt(_))
+            ));
+        }
+        let mut minimum = [0u8; AUTHENTICATOR_DATA_HEADER_LEN as usize];
+        minimum[AUTHENTICATOR_DATA_FLAGS_OFFSET] = FLAG_USER_PRESENT | FLAG_USER_VERIFIED;
+        assert!(check_authenticator_data(minimum.as_ptr(), AUTHENTICATOR_DATA_HEADER_LEN).is_ok());
+    }
+
+    #[test]
+    fn attestation_and_assertion_require_both_user_flags() {
+        let mut data = [0u8; 164];
+        for (flags, missing) in [
+            (FLAG_USER_PRESENT, "verification"),
+            (FLAG_USER_VERIFIED, "presence"),
+            (0, "presence"),
+        ] {
+            data[AUTHENTICATOR_DATA_FLAGS_OFFSET] = flags;
+            for result in [
+                test_attestation(&data).map(|_| ()),
+                test_assertion(&data).map(|_| ()),
+            ] {
+                assert!(matches!(
+                    result,
+                    Err(SealError::Corrupt(reason)) if reason.contains(missing)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn platform_credential_identifiers_can_exceed_64_bytes() {
+        let identifier = [42u8; 128];
+        assert_eq!(
+            read_credential_id(
+                identifier.as_ptr(),
+                u32::try_from(identifier.len()).unwrap()
+            )
+            .unwrap(),
+            identifier
+        );
+    }
+
+    #[test]
+    fn empty_credential_id_is_rejected() {
+        let buffer = [0u8; 1];
+        assert!(matches!(
+            read_credential_id(buffer.as_ptr(), 0),
+            Err(SealError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn null_credential_id_pointer_is_rejected() {
+        assert!(matches!(
+            read_credential_id(std::ptr::null::<u8>(), 1),
+            Err(SealError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn credential_id_at_the_metadata_boundary_is_accepted() {
+        let buffer = [7u8; MAX_CREDENTIAL_ID];
+        assert_eq!(
+            read_credential_id(buffer.as_ptr(), u32::try_from(MAX_CREDENTIAL_ID).unwrap()).unwrap(),
+            buffer
+        );
+    }
+
+    #[test]
+    fn credential_id_beyond_the_metadata_boundary_is_rejected() {
+        let buffer = [0u8; MAX_CREDENTIAL_ID + 1];
+        assert!(matches!(
+            read_credential_id(
+                buffer.as_ptr(),
+                u32::try_from(MAX_CREDENTIAL_ID + 1).unwrap()
+            ),
+            Err(SealError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn max_credential_id_keeps_seventy_two_bytes_for_metadata() {
+        assert_eq!(
+            MAX_CREDENTIAL_ID + 72,
+            CRED_MAX_CREDENTIAL_BLOB_SIZE as usize
+        );
+    }
+
+    #[test]
+    fn prf_salt_carries_the_ctap_one_secret_length() {
+        let salt = prf_salt(&PRF);
+        assert_eq!(salt.cbFirst, HMAC_SECRET_LENGTH);
+        // SAFETY: `pbFirst` points into the 32-byte `PRF` array and `cbFirst` was
+        // verified above as its length, so the read is in bounds and non-null.
+        let bytes = unsafe { std::slice::from_raw_parts(salt.pbFirst, salt.cbFirst as usize) };
+        assert_eq!(bytes, PRF.as_slice());
+    }
+
+    #[test]
+    fn a_prf_secret_of_the_wrong_length_is_refused() {
+        let mut native = [0u8; 32];
+        let salt = WEBAUTHN_HMAC_SECRET_SALT {
+            cbFirst: 16,
+            pbFirst: native.as_mut_ptr(),
+            cbSecond: 0,
+            pbSecond: std::ptr::null_mut(),
+        };
+        assert!(matches!(
+            read_prf_key(&salt, "test"),
+            Err(SealError::Unsupported(_))
+        ));
     }
 
     /// One platform credential entry spec.
