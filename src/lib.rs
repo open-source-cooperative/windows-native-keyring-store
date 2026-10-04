@@ -107,6 +107,27 @@ but deleted at any time, and a plain [Store] refuses to read a sealed secret as 
 on this machine. It needs WebAuthn API 9, which Windows 11 25H2 provides and Windows
 Server 2025 does not.
 
+A [HelloStore] takes its key from the WebAuthn PRF extension of one Windows Hello passkey
+per store, so one approval, anchored to a live window of the application, unlocks every
+entry:
+
+```
+use std::sync::Arc;
+use std::time::Duration;
+
+use keyring_core::api::CredentialStoreApi;
+use windows_native_keyring_store::HelloStore;
+use windows_native_keyring_store::hello::{HelloCancellation, HelloWindow};
+
+fn save_token(window: Arc<dyn HelloWindow>) -> Result<(), Box<dyn std::error::Error>> {
+    let store = HelloStore::new("example-app", "tokens")?;
+    store.unlock(window, &HelloCancellation::new(), Duration::from_secs(120))?;
+    store.build("example-app", "alice", None)?.set_password("refresh-token")?;
+    store.lock();
+    Ok(())
+}
+```
+
 ## Warnings
 
 Tests show that operating on the same entry from different threads
@@ -126,7 +147,10 @@ threads.
 pub mod cred;
 pub use cred::CredPersist;
 pub mod hello;
+pub use hello::HelloStore;
 mod hello_native;
+#[cfg(test)]
+mod hello_tests;
 #[cfg(test)]
 mod pause;
 pub mod sealed;

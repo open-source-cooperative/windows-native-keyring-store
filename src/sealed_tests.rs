@@ -342,6 +342,9 @@ fn seal_errors_map_to_keyring_error_kinds() {
         SealError::TimedOut,
         SealError::Discarding,
         SealError::Discarded,
+        SealError::MissingOwner,
+        SealError::Cancelled,
+        SealError::KeyLost,
     ] {
         assert!(matches!(Error::from(error), Error::NoStorageAccess(_)));
     }
