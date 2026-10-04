@@ -1,10 +1,13 @@
 use byteorder::{ByteOrder, LittleEndian};
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::iter::once;
+use std::ptr;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_BAD_USERNAME, ERROR_INVALID_FLAGS, ERROR_INVALID_PARAMETER, ERROR_NO_SUCH_LOGON_SESSION,
-    ERROR_NOT_FOUND, FILETIME, GetLastError,
+    CloseHandle, ERROR_BAD_USERNAME, ERROR_INVALID_FLAGS, ERROR_INVALID_PARAMETER,
+    ERROR_NO_SUCH_LOGON_SESSION, ERROR_NOT_FOUND, ERROR_TIMEOUT, FILETIME, GetLastError, HANDLE,
+    WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 #[cfg(feature = "search")]
 use windows_sys::Win32::Security::Credentials::CredEnumerateW;
@@ -14,6 +17,8 @@ use windows_sys::Win32::Security::Credentials::{
     CRED_PERSIST_LOCAL_MACHINE, CRED_PERSIST_SESSION, CRED_TYPE_GENERIC, CREDENTIAL_ATTRIBUTEW,
     CREDENTIALW, CredDeleteW, CredFree, CredReadW, CredWriteW,
 };
+use windows_sys::Win32::Security::{GetLengthSid, GetTokenInformation, TOKEN_USER, TokenUser};
+use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 use zeroize::Zeroize;
 
 #[cfg(feature = "search")]
@@ -125,6 +130,90 @@ pub fn validate_attributes(username: &str, target_alias: &str, comment: &str) ->
     Ok(())
 }
 
+/// Longest wait for another caller's Credential Manager call.
+const CALL_LOCK_TIMEOUT_MS: u32 = 60_000;
+
+/// Serializes Credential Manager calls per user across threads and processes, because concurrent calls lose updates ([#20](https://github.com/open-source-cooperative/windows-native-keyring-store/issues/20)).
+///
+/// Not `Send`, because `ReleaseMutex` must run on the owning thread.
+struct CallLock(HANDLE);
+
+impl CallLock {
+    fn acquire() -> Result<Self> {
+        Self::acquire_within(CALL_LOCK_TIMEOUT_MS)
+    }
+
+    fn acquire_within(timeout_ms: u32) -> Result<Self> {
+        let name = lock_name()?;
+        // SAFETY: Default security and a terminated name.
+        let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
+        if handle.is_null() {
+            return Err(decode_error());
+        }
+        // SAFETY: `handle` is a live mutex.
+        match unsafe { WaitForSingleObject(handle, timeout_ms) } {
+            // A holder that exited leaves nothing to repair.
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self(handle)),
+            status => {
+                let error = if status == WAIT_TIMEOUT {
+                    Error::PlatformFailure(wrap(ERROR_TIMEOUT))
+                } else {
+                    decode_error()
+                };
+                // SAFETY: The unowned handle is live and closed once.
+                unsafe { CloseHandle(handle) };
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for CallLock {
+    fn drop(&mut self) {
+        // SAFETY: This thread owns the live mutex, which is released and closed once.
+        unsafe {
+            ReleaseMutex(self.0);
+            CloseHandle(self.0);
+        }
+    }
+}
+
+/// Names the lock after the user, whose credential set it guards.
+fn lock_name() -> Result<Vec<u16>> {
+    let mut name = String::from("Global\\windows-native-keyring-store-");
+    for byte in user_sid()? {
+        write!(name, "{byte:02x}").unwrap();
+    }
+    Ok(to_wstr(&name))
+}
+
+/// Returns the SID of the thread's effective token, which selects the credential set.
+fn user_sid() -> Result<Vec<u8>> {
+    // `GetCurrentThreadEffectiveToken()` pseudo-handle from `processthreadsapi.h`.
+    let token = ptr::without_provenance_mut((-6isize).cast_unsigned());
+    let mut buffer = [0usize; 16];
+    let mut written = 0;
+    // SAFETY: Queryable pseudo-token, writable aligned buffer of the given size and result pointer.
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            size_of_val(&buffer) as u32,
+            &mut written,
+        )
+    } == 0
+    {
+        return Err(decode_error());
+    }
+    // SAFETY: Success wrote a `TOKEN_USER` whose SID lies inside `buffer`.
+    let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    // SAFETY: `sid` is valid while `buffer` lives.
+    let length = unsafe { GetLengthSid(sid) } as usize;
+    // SAFETY: `GetLengthSid` bounds the SID bytes inside `buffer`.
+    Ok(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), length) }.to_vec())
+}
+
 /// Save or create a generic credential with pre-validated data
 pub fn save_credential(
     target_name: &str,
@@ -164,6 +253,7 @@ pub fn save_credential(
         TargetAlias: target_alias.as_mut_ptr(),
         UserName: username.as_mut_ptr(),
     };
+    let _lock = CallLock::acquire()?;
     // Call windows API
     let result = match unsafe { CredWriteW(&credential, 0) } {
         0 => Err(decode_error()),
@@ -178,6 +268,7 @@ pub fn save_credential(
 pub fn delete_credential(target_name: &str) -> Result<()> {
     let target_name = to_wstr(target_name);
     let cred_type = CRED_TYPE_GENERIC;
+    let _lock = CallLock::acquire()?;
     match unsafe { CredDeleteW(target_name.as_ptr(), cred_type, 0) } {
         0 => Err(decode_error()),
         _ => Ok(()),
@@ -197,6 +288,7 @@ pub fn enumerate_credentials(
         regex::escape(&delimiters[2])
     );
     let spec_pat = regex::Regex::new(&spec).unwrap();
+    let _lock = CallLock::acquire()?;
     let mut count: u32 = 0;
     let mut creds = std::ptr::null_mut();
     if unsafe { CredEnumerateW(std::ptr::null(), 0, &mut count, &mut creds) } == 0 {
@@ -229,6 +321,7 @@ pub fn extract_from_credential<F, T>(target_name: &str, f: F) -> Result<T>
 where
     F: FnOnce(&CREDENTIALW) -> Result<T>,
 {
+    let _lock = CallLock::acquire()?;
     let mut p_credential = std::ptr::null_mut();
     // at this point, p_credential is just a pointer to nowhere.
     // The allocation happens in the `CredReadW` call below.
@@ -401,4 +494,41 @@ pub fn decode_error() -> Error {
 
 fn wrap(code: u32) -> Box<dyn std::error::Error + Send + Sync> {
     Box::new(PlatformError(code))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn call_lock_times_out_while_held() {
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let _lock = CallLock::acquire().unwrap();
+                held_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            });
+            held_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            let error = CallLock::acquire_within(100).err();
+            release_tx.send(()).unwrap();
+            assert!(
+                matches!(&error, Some(Error::PlatformFailure(inner))
+                    if inner.downcast_ref::<PlatformError>().map(|e| e.0) == Some(ERROR_TIMEOUT)),
+                "{error:?}"
+            );
+        });
+        assert!(CallLock::acquire().is_ok());
+    }
+
+    #[test]
+    fn call_lock_recovers_from_abandoned_owner() {
+        std::thread::scope(|scope| {
+            scope.spawn(|| std::mem::forget(CallLock::acquire().unwrap()));
+        });
+        assert!(CallLock::acquire().is_ok());
+    }
 }

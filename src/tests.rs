@@ -331,7 +331,6 @@ fn test_create_set_then_move() {
 }
 
 #[test]
-#[ignore] // it's clear that setting on one thread and getting on another is not reliable
 fn test_simultaneous_create_set_then_move() {
     let mut handles = vec![];
     let base = generate_random_string();
@@ -408,6 +407,45 @@ fn test_simultaneous_multiple_create_delete_single_thread() {
     for handle in handles {
         handle.join().unwrap()
     }
+}
+
+#[test]
+fn test_simultaneous_deletes_leave_no_credentials() {
+    let base = &generate_random_string();
+    let names: Vec<String> = (0..10)
+        .flat_map(|t| (0..40).map(move |r| format!("{base}-{t}-{r}")))
+        .collect();
+    let misses: usize = std::thread::scope(|scope| {
+        let workers: Vec<_> = names
+            .chunks(40)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    let mut misses = 0;
+                    for name in chunk {
+                        let entry = entry_new(name, name);
+                        entry.set_password(name).unwrap();
+                        misses += usize::from(entry.get_password().ok().as_deref() != Some(name));
+                        misses += usize::from(entry.delete_credential().is_err());
+                    }
+                    misses
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .sum()
+    });
+    let survivors = names
+        .iter()
+        .filter(|name| {
+            let entry = entry_new(name, name);
+            let found = entry.get_password().is_ok();
+            let _ = entry.delete_credential();
+            found
+        })
+        .count();
+    assert_eq!((misses, survivors), (0, 0), "(failed calls, survivors)");
 }
 
 #[test]
