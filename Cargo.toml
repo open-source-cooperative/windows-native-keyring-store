@@ -17,9 +17,12 @@ default = ["search"]
 search = ["dep:regex"]
 
 [dependencies]
-keyring-core = { version = "1" }
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
 byteorder = "1"
+getrandom = "0.4"
+keyring-core = { version = "1" }
 regex = { version = "1", optional = true }
+thiserror = "2"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
 zeroize = "1"
 

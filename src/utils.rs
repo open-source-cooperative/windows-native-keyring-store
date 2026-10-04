@@ -18,6 +18,7 @@ use zeroize::Zeroize;
 
 #[cfg(feature = "search")]
 use crate::cred::Cred;
+use crate::sealed_crypto::is_protected;
 use keyring_core::error::{Error, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,38 +274,48 @@ pub fn cred_from_credential(credential: &mut CREDENTIALW) -> Cred {
 
 /// A password extractor for use with [extract_from_credential].
 pub fn extract_password(credential: &CREDENTIALW) -> Result<String> {
-    let mut blob = extract_secret(credential)?;
-    // 3rd parties may write credential data with an odd number of bytes,
-    // so we make sure that we don't try to decode those as utf16
-    if blob.len() % 2 != 0 {
+    let blob = credential_blob(credential);
+    if is_protected(blob) {
+        return Err(Error::BadStoreFormat(
+            "protected credential requires a sealed store".into(),
+        ));
+    }
+    password_from_secret(blob.to_vec())
+}
+
+pub(crate) fn password_from_secret(mut blob: Vec<u8>) -> Result<String> {
+    if !blob.len().is_multiple_of(2) {
         return Err(Error::BadEncoding(blob));
     }
-    // This should be a UTF-16 string, so convert it to
-    // a UTF-16 vector and then try to decode it.
     let mut blob_u16 = vec![0; blob.len() / 2];
     LittleEndian::read_u16_into(&blob, &mut blob_u16);
     let result = match String::from_utf16(&blob_u16) {
         Err(_) => Err(Error::BadEncoding(blob)),
         Ok(s) => {
-            // we aren't returning the blob, so clear it
             blob.zeroize();
             Ok(s)
         }
     };
-    // we aren't returning the utf16 blob, so clear it
     blob_u16.zeroize();
     result
 }
 
 /// A secret extractor for use with [extract_from_credential].
 pub fn extract_secret(credential: &CREDENTIALW) -> Result<Vec<u8>> {
-    let blob_pointer: *const u8 = credential.CredentialBlob;
-    let blob_len: usize = credential.CredentialBlobSize as usize;
-    if blob_len == 0 {
-        return Ok(Vec::new());
+    Ok(credential_blob(credential).to_vec())
+}
+
+fn credential_blob(credential: &CREDENTIALW) -> &[u8] {
+    if credential.CredentialBlobSize == 0 {
+        return &[];
     }
-    let blob = unsafe { std::slice::from_raw_parts(blob_pointer, blob_len) };
-    Ok(blob.to_vec())
+    // SAFETY: Credential Manager owns `CredentialBlobSize` bytes at `CredentialBlob` while `credential` lives.
+    unsafe {
+        std::slice::from_raw_parts(
+            credential.CredentialBlob,
+            usize::try_from(credential.CredentialBlobSize).expect("u32 fits usize on Windows"),
+        )
+    }
 }
 
 /// A metadata extractor for use with [extract_from_credential].
