@@ -788,8 +788,9 @@ mod tests {
         results.recv_timeout(pause::BOUND).unwrap()
     }
 
+    /// The error a read through `store` gets, using a service no other store or test shares.
     fn refusal(store: &HelloStore) -> Option<SealError> {
-        let entry = store.build("service", "user", None).unwrap();
+        let entry = store.build(&store.id(), "user", None).unwrap();
         match entry.get_secret() {
             Err(Error::NoStorageAccess(reason)) => reason.downcast_ref::<SealError>().cloned(),
             _ => None,
