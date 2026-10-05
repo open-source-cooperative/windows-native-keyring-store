@@ -368,6 +368,10 @@ unsafe fn from_wstr(ws: *const u16) -> String {
 }
 
 /// Windows error codes are `DWORDS` which are 32-bit unsigned ints.
+///
+/// This is the error boxed inside the `PlatformFailure` and `NoStorageAccess`
+/// variants of the keyring `Error`; callers can recover the code with
+/// `downcast_ref::<PlatformError>()`.
 #[derive(Debug)]
 pub struct PlatformError(pub u32);
 

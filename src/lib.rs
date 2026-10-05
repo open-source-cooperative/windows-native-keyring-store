@@ -95,3 +95,4 @@ pub use store::Store;
 #[cfg(test)]
 mod tests;
 mod utils;
+pub use utils::PlatformError;
