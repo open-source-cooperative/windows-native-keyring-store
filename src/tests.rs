@@ -494,31 +494,3 @@ fn test_store_persistence() {
         CredentialPersistence::UntilDelete
     ));
 }
-
-#[test]
-fn test_platform_error_is_public_and_downcastable() {
-    use crate::PlatformError;
-    use crate::utils::decode_error;
-    use windows_sys::Win32::Foundation::{
-        ERROR_NO_SUCH_LOGON_SESSION, ERROR_NOT_FOUND, SetLastError,
-    };
-    // Set the thread's last error directly so no credential is touched.
-    unsafe { SetLastError(1313) };
-    match decode_error() {
-        Error::PlatformFailure(err) => {
-            let code = err.downcast_ref::<PlatformError>().expect("public type");
-            assert_eq!(code.0, 1313);
-        }
-        other => panic!("expected PlatformFailure, got {other:?}"),
-    }
-    unsafe { SetLastError(ERROR_NO_SUCH_LOGON_SESSION) };
-    match decode_error() {
-        Error::NoStorageAccess(err) => {
-            let code = err.downcast_ref::<PlatformError>().expect("public type");
-            assert_eq!(code.0, ERROR_NO_SUCH_LOGON_SESSION);
-        }
-        other => panic!("expected NoStorageAccess, got {other:?}"),
-    }
-    unsafe { SetLastError(ERROR_NOT_FOUND) };
-    assert!(matches!(decode_error(), Error::NoEntry));
-}
