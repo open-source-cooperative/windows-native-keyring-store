@@ -345,6 +345,16 @@ pub fn extract_attributes(credential: &CREDENTIALW) -> Result<HashMap<String, St
     Ok(result)
 }
 
+/// Lowercase hexadecimal encoding of `bytes`.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    bytes
+        .iter()
+        .flat_map(|byte| [byte >> 4, byte & 15])
+        .map(|nibble| char::from(DIGITS[usize::from(nibble)]))
+        .collect()
+}
+
 /// helper for extract_from_platform
 fn erase_secret(credential: &mut CREDENTIALW) {
     let blob_pointer: *mut u8 = credential.CredentialBlob;
@@ -364,7 +374,11 @@ fn to_wstr_no_null(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
 
-unsafe fn from_wstr(ws: *const u16) -> String {
+/// Reads a NUL-terminated wide string, returning an empty string for null.
+///
+/// # Safety
+/// `ws` must be null or point to a NUL-terminated UTF-16 string valid for the call.
+pub(crate) unsafe fn from_wstr(ws: *const u16) -> String {
     // null pointer case, return empty string
     if ws.is_null() {
         return String::new();

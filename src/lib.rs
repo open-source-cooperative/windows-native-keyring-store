@@ -92,6 +92,7 @@ pub mod cred;
 pub use cred::CredPersist;
 mod sealed;
 mod sealed_crypto;
+mod sealed_lock;
 pub mod store;
 pub use store::Store;
 #[cfg(test)]
