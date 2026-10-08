@@ -95,3 +95,5 @@ pub use store::Store;
 #[cfg(test)]
 mod tests;
 mod utils;
+
+pub mod tpm_key;

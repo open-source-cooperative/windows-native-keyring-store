@@ -1,0 +1,8 @@
+exclude_re = [
+    # Frees NCrypt handles that exist only when a TPM provider opens.
+    "src/tpm_key\\.rs:.*<impl Drop for OwnedHandle>::drop",
+    # Cleans up a key that only a TPM can create.
+    "src/tpm_key\\.rs:.*: replace == with != in TpmSigningKey::create$",
+    # Equivalent, the masked code shares no bits with the facility prefix.
+    "src/tpm_key\\.rs:.*: replace \\| with \\^ in win32_error$",
+]
