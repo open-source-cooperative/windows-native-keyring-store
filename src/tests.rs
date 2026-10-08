@@ -3,7 +3,7 @@ use std::sync::{Arc, Once};
 
 use crate::Store;
 use crate::cred::Cred;
-use crate::utils::{validate_attributes, validate_target};
+use crate::utils::{FoldedName, validate_attributes, validate_target};
 use keyring_core::{CredentialStore, Entry, Error, api::CredentialPersistence, get_default_store};
 use windows_sys::Win32::Security::Credentials::{
     CRED_MAX_GENERIC_TARGET_NAME_LENGTH, CRED_MAX_STRING_LENGTH, CRED_MAX_USERNAME_LENGTH,
@@ -138,6 +138,11 @@ fn test_validate() {
         &generate_random_string_of_len(CRED_MAX_STRING_LENGTH as usize + 1),
     )
     .unwrap_err();
+}
+
+#[test]
+fn test_folded_name() {
+    assert_eq!(FoldedName::new("alice").unwrap().as_str(), "ALICE");
 }
 
 #[test]
