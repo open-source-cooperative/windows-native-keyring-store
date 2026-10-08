@@ -194,6 +194,13 @@ fn test_round_trip_non_ascii_password() {
 }
 
 #[test]
+fn test_round_trip_password_starting_with_a_noncharacter() {
+    let name = generate_random_string();
+    let entry = entry_new(&name, &name);
+    test_round_trip("noncharacter password", &entry, "\u{ffff}secret");
+}
+
+#[test]
 fn test_entries_with_same_and_different_specifiers() {
     let name1 = generate_random_string();
     let name2 = generate_random_string();
@@ -493,4 +500,17 @@ fn test_store_persistence() {
         store.persistence(),
         CredentialPersistence::UntilDelete
     ));
+}
+
+#[test]
+fn ordinary_binary_secret_with_protected_prefix_remains_readable() {
+    let entry = entry_new("binary-secret", &generate_random_string());
+    let secret = b"\x00\xdc\x01binary";
+    entry.set_secret(secret).unwrap();
+    assert_eq!(entry.get_secret().unwrap(), secret);
+    assert!(matches!(
+        entry.get_password(),
+        Err(Error::BadStoreFormat(_))
+    ));
+    entry.delete_credential().unwrap();
 }

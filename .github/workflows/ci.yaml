@@ -37,6 +37,9 @@ jobs:
       - name: Clippy check
         run: cargo clippy --no-deps --all-targets -- -D warnings
 
+      - name: Clippy check without default features
+        run: cargo clippy --no-default-features --no-deps --all-targets -- -D warnings
+
       - name: Build and Test
         run: cargo test --verbose -- --test-threads 1
 
@@ -63,6 +66,9 @@ jobs:
 
       - name: Clippy check
         run: cargo clippy --no-deps --all-targets -- -D warnings
+
+      - name: Clippy check without default features
+        run: cargo clippy --no-default-features --no-deps --all-targets -- -D warnings
 
   package:
     runs-on: windows-latest
