@@ -173,17 +173,17 @@ impl TpmSigningKey {
         // SAFETY: Live provider, terminated name, writable output handle.
         let status =
             unsafe { NCryptOpenKey(provider.0, &mut raw, name.as_ptr(), 0, NCRYPT_SILENT_FLAG) };
-        if status == NTE_BAD_KEYSET {
-            return Ok(None);
+        if key_found(status)? {
+            let key = OwnedHandle(raw);
+            let point = public_point(&key)?;
+            Ok(Some(Self {
+                key: Mutex::new(key),
+                _provider: provider,
+                point,
+            }))
+        } else {
+            Ok(None)
         }
-        check(status)?;
-        let key = OwnedHandle(raw);
-        let point = public_point(&key)?;
-        Ok(Some(Self {
-            key: Mutex::new(key),
-            _provider: provider,
-            point,
-        }))
     }
 
     /// Returns the SEC1 point `0x04 || X || Y`.
@@ -209,10 +209,7 @@ impl TpmSigningKey {
                 NCRYPT_SILENT_FLAG,
             )
         })?;
-        if written != 64 {
-            return Err(TpmKeyError::InvalidOutput);
-        }
-        Ok(signature)
+        decode_signature(signature, written)
     }
 
     /// Deletes the persisted key, returning it on failure.
@@ -365,6 +362,20 @@ fn decode_point(blob: &[u8; 72], written: u32) -> Result<[u8; 65], TpmKeyError> 
     Ok(point)
 }
 
+fn key_found(open_status: i32) -> Result<bool, TpmKeyError> {
+    if open_status == NTE_BAD_KEYSET {
+        return Ok(false);
+    }
+    check(open_status).map(|()| true)
+}
+
+fn decode_signature(signature: [u8; 64], written: u32) -> Result<[u8; 64], TpmKeyError> {
+    if written != 64 {
+        return Err(TpmKeyError::InvalidOutput);
+    }
+    Ok(signature)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,6 +467,26 @@ mod tests {
             check(NTE_BAD_KEYSET),
             Err(TpmKeyError::Windows(NTE_BAD_KEYSET))
         );
+    }
+
+    #[test]
+    fn key_found_maps_missing_names_to_absence() {
+        assert_eq!(key_found(NTE_BAD_KEYSET), Ok(false));
+        assert_eq!(key_found(0), Ok(true));
+        assert_eq!(
+            key_found(TPM_E_DISABLED),
+            Err(TpmKeyError::Unavailable(TPM_E_DISABLED))
+        );
+    }
+
+    #[test]
+    fn rejects_short_signatures() {
+        let signature = [7; 64];
+        assert_eq!(
+            decode_signature(signature, 63),
+            Err(TpmKeyError::InvalidOutput)
+        );
+        assert_eq!(decode_signature(signature, 64), Ok(signature));
     }
 
     #[test]
