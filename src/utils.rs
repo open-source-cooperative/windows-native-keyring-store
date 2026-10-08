@@ -369,9 +369,15 @@ unsafe fn from_wstr(ws: *const u16) -> String {
 
 /// Windows error codes are `DWORDS` which are 32-bit unsigned ints.
 #[derive(Debug)]
-pub struct PlatformError(pub u32);
+pub struct WindowsErrorCode(pub u32);
 
-impl std::fmt::Display for PlatformError {
+impl WindowsErrorCode {
+    pub fn value(&self) -> u32 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for WindowsErrorCode {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self.0 {
             ERROR_NO_SUCH_LOGON_SESSION => write!(f, "Windows ERROR_NO_SUCH_LOGON_SESSION"),
@@ -384,7 +390,7 @@ impl std::fmt::Display for PlatformError {
     }
 }
 
-impl std::error::Error for PlatformError {
+impl std::error::Error for WindowsErrorCode {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         None
     }
@@ -399,6 +405,6 @@ pub fn decode_error() -> Error {
     }
 }
 
-fn wrap(code: u32) -> Box<dyn std::error::Error + Send + Sync> {
-    Box::new(PlatformError(code))
+fn wrap(code: u32) -> keyring_core::error::PlatformError {
+    Box::new(WindowsErrorCode(code))
 }
