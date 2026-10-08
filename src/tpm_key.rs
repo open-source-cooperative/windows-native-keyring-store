@@ -446,6 +446,19 @@ mod tests {
     }
 
     #[test]
+    fn check_separates_success_unavailability_and_other_failures() {
+        assert_eq!(check(0), Ok(()));
+        assert_eq!(
+            check(TPM_E_DISABLED),
+            Err(TpmKeyError::Unavailable(TPM_E_DISABLED))
+        );
+        assert_eq!(
+            check(NTE_BAD_KEYSET),
+            Err(TpmKeyError::Windows(NTE_BAD_KEYSET))
+        );
+    }
+
+    #[test]
     fn private_key_cannot_be_exported() {
         use windows_sys::Win32::Security::Cryptography::BCRYPT_ECCPRIVATE_BLOB;
         let name = format!("keyring-tpm-private-test-{:016x}", fastrand::u64(..));

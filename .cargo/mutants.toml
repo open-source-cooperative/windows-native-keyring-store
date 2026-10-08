@@ -1,0 +1,4 @@
+exclude_re = [
+    # Frees NCrypt handles that exist only when a TPM provider opens.
+    "src/tpm_key\\.rs:.*<impl Drop for OwnedHandle>::drop",
+]
