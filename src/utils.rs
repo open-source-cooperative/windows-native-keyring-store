@@ -405,6 +405,6 @@ pub fn decode_error() -> Error {
     }
 }
 
-fn wrap(code: u32) -> Box<dyn std::error::Error + Send + Sync> {
+fn wrap(code: u32) -> keyring_core::error::PlatformError {
     Box::new(WindowsErrorCode(code))
 }
