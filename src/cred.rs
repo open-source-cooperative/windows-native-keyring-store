@@ -207,6 +207,9 @@ impl CredentialApi for Cred {
 
     /// See the keyring-core API docs.
     fn delete_credential(&self) -> Result<()> {
+        if let Some(sealed) = &self.sealed {
+            return sealed.gate.delete(&self.target_name);
+        }
         delete_credential(&self.target_name)
     }
 

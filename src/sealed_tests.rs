@@ -1,8 +1,10 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 use keyring_core::{Entry, Error, api::CredentialStoreApi};
 
+use crate::pause;
 use crate::sealed::{
     MAX_PROTECTED_PLAINTEXT, Protection, SealError, scoped_canonical, validate_protected_plaintext,
 };
@@ -28,24 +30,34 @@ fn write_raw(target: &str, bytes: &[u8]) {
 /// A store with a fresh name whose records are deleted when the test ends.
 struct Scope {
     application: String,
+    name: String,
     store: Arc<SealedStore>,
     targets: Vec<String>,
 }
 
 impl Scope {
     fn new() -> Self {
-        let application = format!("sealed-test-{}", fastrand::u64(..));
-        let store = SealedStore::new(&application, "store").unwrap();
+        Self::named(format!("sealed-test-{}", fastrand::u64(..)), "store")
+    }
+
+    fn named(application: String, name: &str) -> Self {
+        let store = SealedStore::new(&application, name).unwrap();
         assert_store_id(&store);
+        store.assert_usable();
         Self {
             store,
             application,
+            name: name.into(),
             targets: Vec::new(),
         }
     }
 
+    fn sibling(&self, name: &str) -> Self {
+        Self::named(self.application.clone(), name)
+    }
+
     fn reopen(&self) -> Arc<SealedStore> {
-        SealedStore::new(&self.application, "store").unwrap()
+        SealedStore::new(&self.application, &self.name).unwrap()
     }
 
     fn entry(&mut self, user: &str) -> Entry {
@@ -57,11 +69,19 @@ impl Scope {
     fn keycheck(&self) -> String {
         format!("{}keycheck", self.store.id())
     }
+
+    fn control(&self) -> String {
+        format!("{}control", self.store.id())
+    }
 }
 
 impl Drop for Scope {
     fn drop(&mut self) {
-        for target in self.targets.iter().chain([&self.keycheck()]) {
+        for target in self
+            .targets
+            .iter()
+            .chain([&self.keycheck(), &self.control()])
+        {
             let _ = delete_credential(target);
         }
     }
@@ -310,7 +330,13 @@ fn seal_errors_map_to_keyring_error_kinds() {
         Error::from(SealError::Platform("service".into())),
         Error::PlatformFailure(_)
     ));
-    for error in [SealError::Locked, SealError::WrongKey, SealError::TimedOut] {
+    for error in [
+        SealError::Locked,
+        SealError::WrongKey,
+        SealError::TimedOut,
+        SealError::Discarding,
+        SealError::Discarded,
+    ] {
         assert!(matches!(Error::from(error), Error::NoStorageAccess(_)));
     }
 }
@@ -474,4 +500,292 @@ fn plaintexts_up_to_the_protected_capacity_pass_and_longer_ones_are_refused() {
         Err(Error::TooLong(_, limit))
             if usize::try_from(limit).expect("u32 fits usize") == MAX_PROTECTED_PLAINTEXT
     ));
+}
+
+const DISCARD_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound for every wait on a paused discarder, so a refused discard ends the test promptly.
+const DISCARD_WAIT: Duration = Duration::from_secs(4);
+
+#[test]
+fn discard_retires_every_handle_and_spares_a_sibling_store() {
+    let mut scope = Scope::new();
+    let mut sibling = scope.sibling("other");
+    scope.store.unlock(&[21; 32]).unwrap();
+    sibling.store.unlock(&[21; 32]).unwrap();
+    let entry = scope.entry("user");
+    entry.set_secret(b"discarded").unwrap();
+    let kept = sibling.entry("user");
+    kept.set_secret(b"kept").unwrap();
+    let second = scope.reopen();
+    second.unlock(&[21; 32]).unwrap();
+    let second_entry = second.build("service", "user", None).unwrap();
+
+    scope.store.discard(DISCARD_TIMEOUT).unwrap();
+
+    assert_eq!(scope.store.protection(), Protection::Locked);
+    assert!(refused_with(entry.get_secret(), &SealError::Discarded));
+    assert!(refused_with(
+        second_entry.get_secret(),
+        &SealError::Discarded
+    ));
+    assert!(refused_with(
+        second_entry.delete_credential(),
+        &SealError::Discarded
+    ));
+    assert_eq!(second.unlock(&[21; 32]), Err(SealError::Discarded));
+    assert_eq!(
+        scope.store.discard(DISCARD_TIMEOUT),
+        Err(SealError::Discarded)
+    );
+    assert!(matches!(raw(&target_of(&entry)), Err(Error::NoEntry)));
+    assert!(matches!(raw(&scope.keycheck()), Err(Error::NoEntry)));
+    assert_eq!(kept.get_secret().unwrap(), b"kept");
+
+    let fresh = scope.reopen();
+    fresh.unlock(&[22; 32]).unwrap();
+    let reborn = fresh.build("service", "user", None).unwrap();
+    assert!(matches!(reborn.get_secret(), Err(Error::NoEntry)));
+    reborn.set_secret(b"second generation").unwrap();
+
+    scope.reopen().discard(DISCARD_TIMEOUT).unwrap();
+    assert!(refused_with(reborn.get_secret(), &SealError::Discarded));
+}
+
+#[test]
+fn corrupt_control_record_blocks_the_store_until_discard() {
+    let mut scope = Scope::new();
+    scope.store.unlock(&[23; 32]).unwrap();
+    let entry = scope.entry("user");
+    entry.set_secret(b"sealed").unwrap();
+    write_raw(&scope.control(), b"garbage");
+
+    let blocked = scope.reopen();
+    assert_eq!(blocked.unlock(&[23; 32]), Err(SealError::Discarding));
+    assert!(refused_with(entry.get_secret(), &SealError::Discarding));
+    blocked.discard(DISCARD_TIMEOUT).unwrap();
+    assert!(matches!(raw(&target_of(&entry)), Err(Error::NoEntry)));
+    scope.reopen().unlock(&[24; 32]).unwrap();
+}
+
+#[test]
+fn an_interrupted_discard_blocks_until_any_handle_resumes_it() {
+    let mut scope = Scope::new();
+    scope.store.unlock(&[25; 32]).unwrap();
+    let entry = scope.entry("user");
+    entry.set_secret(b"sealed").unwrap();
+    let mut marker = crate::sealed::CONTROL_MAGIC.to_vec();
+    marker.push(1);
+    marker.extend([7; 16]);
+    write_raw(&scope.control(), &marker);
+
+    assert!(refused_with(
+        entry.set_secret(b"replacement"),
+        &SealError::Discarding
+    ));
+    assert!(refused_with(
+        entry.delete_credential(),
+        &SealError::Discarding
+    ));
+    assert_eq!(scope.store.unlock(&[25; 32]), Err(SealError::Discarding));
+    scope.store.discard(DISCARD_TIMEOUT).unwrap();
+    assert!(matches!(raw(&target_of(&entry)), Err(Error::NoEntry)));
+    assert!(matches!(raw(&scope.keycheck()), Err(Error::NoEntry)));
+    scope.reopen().unlock(&[26; 32]).unwrap();
+}
+
+#[test]
+fn discard_times_out_on_a_held_store_lock_and_succeeds_once_released() {
+    let scope = Scope::new();
+    let control = scope.control();
+    let (held, holding) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _lock = crate::sealed_lock::lock_target(&control).unwrap();
+        held.send(()).unwrap();
+        released.recv_timeout(crate::pause::BOUND).unwrap();
+    });
+    holding.recv_timeout(crate::pause::BOUND).unwrap();
+    assert_eq!(
+        scope.store.discard(Duration::from_millis(200)),
+        Err(SealError::TimedOut)
+    );
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    assert_eq!(scope.store.discard(DISCARD_TIMEOUT), Ok(()));
+}
+
+#[test]
+fn a_deleted_control_record_never_revives_a_retired_generation() {
+    let mut scope = Scope::new();
+    scope.store.discard(DISCARD_TIMEOUT).unwrap();
+    let current = scope.reopen();
+    current.unlock(&[27; 32]).unwrap();
+    let entry = current.build("service", "user", None).unwrap();
+    scope.targets.push(target_of(&entry));
+    delete_credential(&scope.control()).unwrap();
+
+    assert!(refused_with(entry.get_secret(), &SealError::Discarded));
+    assert_eq!(current.discard(DISCARD_TIMEOUT), Err(SealError::Discarded));
+}
+
+/// Runs `discard` on a named thread, reporting its result on `results`.
+fn spawn_discard(
+    store: Arc<SealedStore>,
+    name: &'static str,
+    results: &mpsc::Sender<(&'static str, Result<(), SealError>)>,
+) {
+    let results = results.clone();
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            results
+                .send((name, store.discard(DISCARD_TIMEOUT)))
+                .unwrap()
+        })
+        .unwrap();
+}
+
+/// The next arrival at `point` within `DISCARD_WAIT`, failing fast if the discarder finished first.
+fn arrival_of(
+    point: &pause::Arrivals,
+    finished: &mpsc::Receiver<(&'static str, Result<(), SealError>)>,
+    what: &str,
+) -> pause::Arrival {
+    let deadline = Instant::now() + DISCARD_WAIT;
+    loop {
+        if let Some(arrival) = point.within(Duration::from_millis(50)) {
+            return arrival;
+        }
+        if let Ok((name, result)) = finished.try_recv() {
+            panic!("{what} ended before its pause point: {name} {result:?}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what} never reached its pause point"
+        );
+    }
+}
+
+#[test]
+fn overlapping_discarders_never_delete_the_next_generation() {
+    let mut scope = Scope::new();
+    scope.store.unlock(&[41; 32]).unwrap();
+    scope.entry("user").set_secret(b"old generation").unwrap();
+    let prefix = scope.store.id();
+    let entered = pause::arm(&prefix, "discard.entered");
+    let deleting = pause::arm(&prefix, "discard.deleting");
+    let (results, finished) = mpsc::channel();
+
+    spawn_discard(Arc::clone(&scope.store), "first", &results);
+    let first_entered = entered.next();
+    assert_eq!(first_entered.thread.as_deref(), Some("first"));
+    first_entered.resume();
+    let first_deleting = arrival_of(&deleting, &finished, "the first discard");
+    assert_eq!(first_deleting.thread.as_deref(), Some("first"));
+    spawn_discard(scope.reopen(), "second", &results);
+    let second_entered = entered.next();
+    assert_eq!(second_entered.thread.as_deref(), Some("second"));
+    second_entered.resume();
+    first_deleting.resume();
+    assert_eq!(
+        finished.recv_timeout(DISCARD_WAIT).unwrap(),
+        ("first", Ok(()))
+    );
+
+    let next = scope.reopen();
+    next.unlock(&[42; 32]).unwrap();
+    let written = next.build("service", "user", None).unwrap();
+    written.set_secret(b"next generation").unwrap();
+
+    let deadline = Instant::now() + DISCARD_WAIT;
+    let second = loop {
+        if let Some(arrival) = deleting.within(Duration::from_millis(50)) {
+            arrival.resume();
+        }
+        if let Ok(result) = finished.try_recv() {
+            break result;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the second discard never finished"
+        );
+    };
+    assert_eq!(written.get_secret().unwrap(), b"next generation");
+    assert!(raw(&scope.keycheck()).is_ok());
+    assert_eq!(second, ("second", Err(SealError::Discarded)));
+}
+
+#[test]
+fn an_in_progress_discard_marks_its_generation_as_discarding() {
+    let mut scope = Scope::new();
+    scope.store.discard(DISCARD_TIMEOUT).unwrap();
+    let current = scope.reopen();
+    current.unlock(&[31; 32]).unwrap();
+    let entry = current.build("service", "user", None).unwrap();
+    scope.targets.push(target_of(&entry));
+    entry.set_secret(b"second generation").unwrap();
+    let mut expected = raw(&scope.control()).unwrap();
+    expected[5] = 1;
+    let prefix = scope.store.id();
+    let entered = pause::arm(&prefix, "discard.entered");
+    let deleting = pause::arm(&prefix, "discard.deleting");
+    let (results, finished) = mpsc::channel();
+
+    spawn_discard(current, "second", &results);
+    arrival_of(&entered, &finished, "the discard").resume();
+    let paused = arrival_of(&deleting, &finished, "the discard");
+    assert_eq!(raw(&scope.control()).unwrap(), expected);
+    paused.resume();
+    assert_eq!(
+        finished.recv_timeout(DISCARD_WAIT).unwrap(),
+        ("second", Ok(()))
+    );
+    assert!(matches!(raw(&target_of(&entry)), Err(Error::NoEntry)));
+}
+
+#[test]
+fn a_resumed_discard_keeps_the_generation_of_the_interrupted_marker() {
+    let mut scope = Scope::new();
+    scope.store.unlock(&[32; 32]).unwrap();
+    let entry = scope.entry("user");
+    entry.set_secret(b"sealed").unwrap();
+    let mut marker = crate::sealed::CONTROL_MAGIC.to_vec();
+    marker.push(1);
+    marker.extend([7; 16]);
+    write_raw(&scope.control(), &marker);
+    let prefix = scope.store.id();
+    let entered = pause::arm(&prefix, "discard.entered");
+    let deleting = pause::arm(&prefix, "discard.deleting");
+    let (results, finished) = mpsc::channel();
+
+    spawn_discard(Arc::clone(&scope.store), "resuming", &results);
+    arrival_of(&entered, &finished, "the discard").resume();
+    let paused = arrival_of(&deleting, &finished, "the discard");
+    assert_eq!(raw(&scope.control()).unwrap(), marker);
+    paused.resume();
+    assert_eq!(
+        finished.recv_timeout(DISCARD_WAIT).unwrap(),
+        ("resuming", Ok(()))
+    );
+    assert!(matches!(raw(&target_of(&entry)), Err(Error::NoEntry)));
+}
+
+/// Rewrites `target`'s record under its upper-case spelling, which Credential Manager then lists.
+fn recase(target: &str) {
+    let blob = raw(target).unwrap();
+    delete_credential(target).unwrap();
+    write_raw(&target.to_uppercase(), &blob);
+}
+
+#[test]
+fn a_record_rewritten_in_another_case_stays_in_its_store() {
+    let mut scope = Scope::new();
+    scope.store.unlock(&[93; 32]).unwrap();
+    let entry = scope.entry("user");
+    entry.set_password("kept").unwrap();
+    let target = target_of(&entry);
+    recase(&target);
+    assert_eq!(entry.get_password().unwrap(), "kept");
+    scope.store.discard(DISCARD_TIMEOUT).unwrap();
+    assert!(matches!(raw(&target), Err(Error::NoEntry)));
 }
