@@ -204,6 +204,44 @@ pub(crate) fn save_spelled_credential(
     )
 }
 
+/// The `{user}.{service}` spelling a sealed record keeps in its attributes, if it has a whole one.
+#[cfg(feature = "search")]
+pub(crate) fn spelling(credential: &CREDENTIALW) -> Option<String> {
+    let mut chunks: Vec<(usize, &[u8])> = Vec::new();
+    for index in 0..credential.AttributeCount as usize {
+        // SAFETY: Credential Manager returns `AttributeCount` attributes valid while `credential` lives.
+        let attribute = unsafe { &*credential.Attributes.add(index) };
+        // SAFETY: every returned attribute has a NUL-terminated keyword.
+        let keyword = unsafe { from_wstr(attribute.Keyword) };
+        let Some(position) = keyword.strip_prefix(SPELLING_KEYWORD) else {
+            continue;
+        };
+        let value = if attribute.ValueSize == 0 {
+            &[][..]
+        } else {
+            // SAFETY: the attribute's value holds `ValueSize` bytes while `credential` lives.
+            unsafe { std::slice::from_raw_parts(attribute.Value, attribute.ValueSize as usize) }
+        };
+        chunks.push((position.parse().ok()?, value));
+    }
+    chunks.sort_unstable_by_key(|&(position, _)| position);
+    if chunks.is_empty()
+        || chunks
+            .iter()
+            .enumerate()
+            .any(|(expected, &(position, _))| expected != position)
+    {
+        return None;
+    }
+    String::from_utf8(
+        chunks
+            .into_iter()
+            .flat_map(|(_, value)| value.iter().copied())
+            .collect(),
+    )
+    .ok()
+}
+
 fn write_credential(
     target_name: &str,
     user: &str,
@@ -558,4 +596,71 @@ pub fn decode_error() -> Error {
 
 fn wrap(code: u32) -> Box<dyn std::error::Error + Send + Sync> {
     Box::new(PlatformError(code))
+}
+
+#[cfg(test)]
+#[cfg(feature = "search")]
+mod tests {
+    use super::{SPELLING_KEYWORD, spelling, to_wstr};
+    use windows_sys::Win32::Security::Credentials::{CREDENTIAL_ATTRIBUTEW, CREDENTIALW};
+
+    /// A credential whose spelling is split over its `keyring:spelling:` attributes.
+    struct Cred {
+        credential: CREDENTIALW,
+        _keywords: Vec<Vec<u16>>,
+        _values: Vec<Vec<u8>>,
+        _attributes: Vec<CREDENTIAL_ATTRIBUTEW>,
+    }
+
+    /// Builds a credential whose spelling chunks live under `keyring:spelling:<position>`.
+    fn spelled(chunks: &[(usize, &[u8])]) -> Cred {
+        let mut keywords: Vec<Vec<u16>> = chunks
+            .iter()
+            .map(|&(position, _)| to_wstr(&format!("{SPELLING_KEYWORD}{position}")))
+            .collect();
+        let mut values: Vec<Vec<u8>> = chunks.iter().map(|&(_, value)| value.to_vec()).collect();
+        let mut attributes: Vec<CREDENTIAL_ATTRIBUTEW> = chunks
+            .iter()
+            .enumerate()
+            .map(|(index, _)| CREDENTIAL_ATTRIBUTEW {
+                Keyword: keywords[index].as_mut_ptr(),
+                Flags: 0,
+                ValueSize: u32::try_from(values[index].len()).expect("a test chunk fits u32"),
+                Value: values[index].as_mut_ptr(),
+            })
+            .collect();
+        let credential = CREDENTIALW {
+            AttributeCount: u32::try_from(attributes.len()).expect("a test credential fits u32"),
+            Attributes: if attributes.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                attributes.as_mut_ptr()
+            },
+            ..Default::default()
+        };
+        Cred {
+            credential,
+            _keywords: keywords,
+            _values: values,
+            _attributes: attributes,
+        }
+    }
+
+    #[test]
+    fn a_record_without_spelling_chunks_has_no_spelling() {
+        let cred = spelled(&[]);
+        assert_eq!(spelling(&cred.credential), None);
+    }
+
+    #[test]
+    fn a_record_missing_a_spelling_chunk_has_no_spelling() {
+        let cred = spelled(&[(1, b"world")]);
+        assert_eq!(spelling(&cred.credential), None);
+    }
+
+    #[test]
+    fn a_record_reassembles_its_spelling_chunks() {
+        let cred = spelled(&[(1, b"world"), (0, b"hello ")]);
+        assert_eq!(spelling(&cred.credential), Some("hello world".into()));
+    }
 }

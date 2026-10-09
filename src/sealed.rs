@@ -422,6 +422,19 @@ impl Gate {
 
     /// Every target of this store that starts with `kind` after the store prefix.
     fn targets_under(&self, kind: &str) -> SealResult<Vec<String>> {
+        Ok(self
+            .listed_under(kind, |_| ())?
+            .into_iter()
+            .map(|(target, ())| target)
+            .collect())
+    }
+
+    /// Every record of this store under `kind`, by canonical target, with what `read` takes from it.
+    fn listed_under<T>(
+        &self,
+        kind: &str,
+        read: impl Fn(&CREDENTIALW) -> T,
+    ) -> SealResult<Vec<(String, T)>> {
         let kind_prefix = format!("{}{kind}", self.prefix);
         let filter: Vec<u16> = format!("{kind_prefix}*\0").encode_utf16().collect();
         let mut count = 0;
@@ -440,10 +453,13 @@ impl Gate {
                 usize::try_from(count).expect("u32 fits usize on Windows"),
             )
         };
-        let listed: Vec<String> = native
+        let listed: Vec<(String, T)> = native
             .iter()
-            // SAFETY: every enumerated pointer refers to a credential that lives until `CredFree`.
-            .map(|credential| crate::utils::target_name(unsafe { &**credential }))
+            .map(|credential| {
+                // SAFETY: every enumerated pointer refers to a credential that lives until `CredFree`.
+                let credential = unsafe { &**credential };
+                (crate::utils::target_name(credential), read(credential))
+            })
             .collect();
         // SAFETY: `entries` came from the successful enumeration above and is freed exactly once.
         unsafe { CredFree(entries.cast()) };
@@ -451,9 +467,9 @@ impl Gate {
         // spelling, so each listed name is checked in its folded and lowered form.
         listed
             .into_iter()
-            .map(|target| {
+            .map(|(target, value)| {
                 let folded = FoldedName::new(&target).map_err(platform)?;
-                scoped_canonical(&folded, &kind_prefix)
+                scoped_canonical(&folded, &kind_prefix).map(|canonical| (canonical, value))
             })
             .collect()
     }
@@ -682,6 +698,53 @@ impl Gate {
                 delete_owned(marker)?;
             }
             removed
+        })
+    }
+
+    /// Entries of this store whose last written `{user}.{service}` matches the optional `pattern`.
+    #[cfg(feature = "search")]
+    pub(crate) fn search(self: &Arc<Self>, spec: &HashMap<&str, &str>) -> Result<Vec<Entry>> {
+        let spec = parse_attributes(&["pattern"], Some(spec))?;
+        let pattern = spec
+            .get("pattern")
+            .map(|pattern| {
+                regex::Regex::new(pattern).map_err(|_| {
+                    Error::Invalid(
+                        pattern.to_string(),
+                        "is not a valid regular expression".into(),
+                    )
+                })
+            })
+            .transpose()?;
+        let names = regex::Regex::new(r"^(.*)\.(.*)$").expect("the name pattern is valid");
+        self.guarded(|| {
+            let mut entries = Vec::new();
+            for (target_name, spelling) in self.listed_under("entry:", crate::utils::spelling)? {
+                // A record written without its spelling is named by its folded name.
+                let spelling = match spelling {
+                    Some(spelling) => spelling,
+                    None => self.legacy_target(&target_name)?,
+                };
+                if pattern
+                    .as_ref()
+                    .is_some_and(|pattern| !pattern.is_match(&spelling))
+                {
+                    continue;
+                }
+                let specifiers = names
+                    .captures(&spelling)
+                    .map(|captures| (captures[2].to_owned(), captures[1].to_owned()));
+                entries.push(Entry::new_with_credential(Arc::new(Cred {
+                    target_name,
+                    specifiers,
+                    persistence: CredPersist::Local,
+                    sealed: Some(SealedEntry {
+                        gate: Arc::clone(self),
+                        spelling,
+                    }),
+                })));
+            }
+            Ok(entries)
         })
     }
 }

@@ -437,3 +437,25 @@ fn an_unlock_on_a_host_without_hello_prf_writes_nothing_and_discard_succeeds() {
     ));
     assert_eq!(scope.store.discard(DISCARD_TIMEOUT), Ok(()));
 }
+
+#[cfg(feature = "search")]
+#[test]
+fn hello_search_lists_entries_of_this_store_only() {
+    let mut scope = Scope::new("search");
+    let sealed = SealedStore::new(&scope.application, "search").unwrap();
+    scope.store.install_test_key([81; 32]);
+    let entry = scope.entry("user");
+    entry.set_secret(b"hello").unwrap();
+    assert!(
+        sealed
+            .search(&std::collections::HashMap::new())
+            .unwrap()
+            .is_empty()
+    );
+    let found = scope
+        .store
+        .search(&std::collections::HashMap::new())
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].get_secret().unwrap(), b"hello");
+}
