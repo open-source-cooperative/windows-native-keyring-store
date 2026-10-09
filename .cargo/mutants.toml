@@ -20,4 +20,6 @@ exclude_re = [
     "src/hello_native\\.rs:.*: replace \\| with \\^ in hresult_from_win32$",
     # Equivalent, the 6-bit groups occupy disjoint bits.
     "src/hello_native\\.rs:.*: replace \\| with \\^ in base64url$",
+    # Equivalent, the high and low nibbles occupy disjoint bits.
+    "src/sealed\\.rs:.*: replace \\| with \\^ in decode_hex$",
 ]
