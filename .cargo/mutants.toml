@@ -14,4 +14,10 @@ exclude_re = [
     # Read only by webauthn.dll, whose answer differs only where Windows Hello holds credentials or runs a ceremony.
     "src/hello_native\\.rs:.*: replace NativeBuffers::add_bytes_owned -> \\*const u8 with Default::default\\(\\)$",
     "src/hello_native\\.rs:.*: replace NativeBuffers::add_wide -> \\*const u16 with Default::default\\(\\)$",
+    # Reaches only webauthn.dll, which cancels nothing without a live Hello prompt.
+    "src/hello_native\\.rs:.*: replace HelloCancellation::abort_native with \\(\\)$",
+    # Equivalent, the masked code shares no bits with the facility prefix.
+    "src/hello_native\\.rs:.*: replace \\| with \\^ in hresult_from_win32$",
+    # Equivalent, the 6-bit groups occupy disjoint bits.
+    "src/hello_native\\.rs:.*: replace \\| with \\^ in base64url$",
 ]
