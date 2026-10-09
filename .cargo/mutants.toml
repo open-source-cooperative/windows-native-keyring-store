@@ -3,4 +3,15 @@ exclude_re = [
     "src/hello\\.rs:.*: replace capability -> .*Result<\\(\\), SealError> with Ok\\(\\(\\)\\)$",
     "src/hello_native\\.rs:.*: replace available -> .*Result<\\(\\), SealError> with Ok\\(\\(\\)\\)$",
     "src/hello_native\\.rs:.*: replace select_hello_authenticator -> .*Result<Vec<u8>, SealError> with Ok\\(vec!\\[[01]?\\]\\)$",
+    # Decided only by whether Windows Hello holds a matching credential.
+    "src/hello_native\\.rs:.*: replace recover_created -> .*Result<Option<Vec<u8>>, SealError> with Ok\\(None\\)$",
+    "src/hello_native\\.rs:.*: replace owned_credentials -> .*Result<Vec<Vec<u8>>, SealError> with Ok\\(vec!\\[\\]\\)$",
+    "src/hello_native\\.rs:.*: replace list_platform_credentials -> .*Result<Vec<ListedCredential>, SealError> with Ok\\(vec!\\[\\]\\)$",
+    "src/hello_native\\.rs:.*: replace remove_exact -> .*Result<\\(\\), SealError> with Ok\\(\\(\\)\\)$",
+    "src/hello_native\\.rs:.*: replace remove_all_for_rp -> .*Result<\\(\\), SealError> with Ok\\(\\(\\)\\)$",
+    "src/hello_native\\.rs:.*: replace delete_verified -> .*Result<\\(\\), SealError> with Ok\\(\\(\\)\\)$",
+    "src/hello_native\\.rs:.*: replace delete_credential -> .*Result<\\(\\), SealError> with Ok\\(\\(\\)\\)$",
+    # Read only by webauthn.dll, whose answer differs only where Windows Hello holds credentials or runs a ceremony.
+    "src/hello_native\\.rs:.*: replace NativeBuffers::add_bytes_owned -> \\*const u8 with Default::default\\(\\)$",
+    "src/hello_native\\.rs:.*: replace NativeBuffers::add_wide -> \\*const u16 with Default::default\\(\\)$",
 ]
