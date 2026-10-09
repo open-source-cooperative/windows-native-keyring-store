@@ -327,9 +327,15 @@ fn seal_errors_map_to_keyring_error_kinds() {
         Error::BadStoreFormat(_)
     ));
     assert!(matches!(
-        Error::from(SealError::Platform("service".into())),
-        Error::PlatformFailure(_)
+        Error::from(SealError::Unsupported("webauthn".into())),
+        Error::NotSupportedByStore(_)
     ));
+    for error in [
+        SealError::Platform("service".into()),
+        SealError::Conflict("authenticators".into()),
+    ] {
+        assert!(matches!(Error::from(error), Error::PlatformFailure(_)));
+    }
     for error in [
         SealError::Locked,
         SealError::WrongKey,
