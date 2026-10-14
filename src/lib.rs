@@ -94,4 +94,5 @@ pub mod store;
 pub use store::Store;
 #[cfg(test)]
 mod tests;
+mod user_lock;
 mod utils;
