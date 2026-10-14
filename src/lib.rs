@@ -96,3 +96,5 @@ pub use store::Store;
 mod tests;
 mod user_lock;
 mod utils;
+
+pub mod tpm_key;
