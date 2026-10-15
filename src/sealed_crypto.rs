@@ -1,5 +1,4 @@
 //! AES-256-GCM codec binding each sealed secret to its store and target.
-#![expect(dead_code, reason = "seal and open are called by Gate")]
 
 use crate::sealed::SealError;
 
@@ -62,13 +61,8 @@ pub(crate) fn seal(
     Ok(std::mem::take(&mut *blob))
 }
 
-/// Open a protected blob into a buffer erased when dropped.
-pub(crate) fn open(
-    key: &[u8; 32],
-    store: &str,
-    target: &str,
-    blob: &[u8],
-) -> Result<Zeroizing<Vec<u8>>, SealError> {
+/// Checks that `blob` has the supported protected-record layout, before any key is involved.
+pub(crate) fn check_layout(blob: &[u8]) -> Result<(), SealError> {
     if blob.len() < MIN_BLOB_LEN {
         return Err(SealError::Corrupt(format!(
             "protected blob is {len} bytes, needs at least {MIN_BLOB_LEN}",
@@ -86,6 +80,17 @@ pub(crate) fn open(
             version = blob[VERSION_AT]
         )));
     }
+    Ok(())
+}
+
+/// Open a protected blob into a buffer erased when dropped.
+pub(crate) fn open(
+    key: &[u8; 32],
+    store: &str,
+    target: &str,
+    blob: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, SealError> {
+    check_layout(blob)?;
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
     nonce_bytes.copy_from_slice(&blob[NONCE_AT..NONCE_END]);

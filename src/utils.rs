@@ -8,13 +8,15 @@ use windows_sys::Win32::Foundation::{
     ERROR_NO_SUCH_LOGON_SESSION, ERROR_NOT_FOUND, ERROR_TIMEOUT, FILETIME, GetLastError, HANDLE,
     WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
+use windows_sys::Win32::Globalization::{LCMAP_UPPERCASE, LCMapStringEx, LOCALE_NAME_INVARIANT};
 #[cfg(feature = "search")]
 use windows_sys::Win32::Security::Credentials::CredEnumerateW;
 use windows_sys::Win32::Security::Credentials::{
-    CRED_FLAGS, CRED_MAX_CREDENTIAL_BLOB_SIZE, CRED_MAX_GENERIC_TARGET_NAME_LENGTH,
-    CRED_MAX_STRING_LENGTH, CRED_MAX_USERNAME_LENGTH, CRED_PERSIST, CRED_PERSIST_ENTERPRISE,
-    CRED_PERSIST_LOCAL_MACHINE, CRED_PERSIST_SESSION, CRED_TYPE_GENERIC, CREDENTIAL_ATTRIBUTEW,
-    CREDENTIALW, CredDeleteW, CredFree, CredReadW, CredWriteW,
+    CRED_FLAGS, CRED_MAX_ATTRIBUTES, CRED_MAX_CREDENTIAL_BLOB_SIZE,
+    CRED_MAX_GENERIC_TARGET_NAME_LENGTH, CRED_MAX_STRING_LENGTH, CRED_MAX_USERNAME_LENGTH,
+    CRED_MAX_VALUE_SIZE, CRED_PERSIST, CRED_PERSIST_ENTERPRISE, CRED_PERSIST_LOCAL_MACHINE,
+    CRED_PERSIST_SESSION, CRED_TYPE_GENERIC, CREDENTIAL_ATTRIBUTEW, CREDENTIALW, CredDeleteW,
+    CredFree, CredReadW, CredWriteW,
 };
 use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 use zeroize::Zeroize;
@@ -135,10 +137,10 @@ const CALL_LOCK_TIMEOUT_MS: u32 = 60_000;
 /// Serializes Credential Manager calls per user across threads and processes, because concurrent calls lose updates ([#20](https://github.com/open-source-cooperative/windows-native-keyring-store/issues/20)).
 ///
 /// Not `Send`, because `ReleaseMutex` must run on the owning thread.
-struct CallLock(HANDLE);
+pub(crate) struct CallLock(HANDLE);
 
 impl CallLock {
-    fn acquire() -> Result<Self> {
+    pub(crate) fn acquire() -> Result<Self> {
         Self::acquire_within(CALL_LOCK_TIMEOUT_MS)
     }
 
@@ -205,6 +207,82 @@ pub fn save_credential(
     secret: &[u8],
     persistence: &CredPersist,
 ) -> Result<()> {
+    write_credential(
+        target_name,
+        user,
+        target_alias,
+        comment,
+        secret,
+        persistence,
+        &mut [],
+    )
+}
+
+const SPELLING_KEYWORD: &str = "keyring:spelling:";
+
+/// The longest `{user}.{service}` spelling, in UTF-8 bytes, that the attributes of one record hold.
+pub(crate) const MAX_SPELLING_LEN: usize = (CRED_MAX_ATTRIBUTES * CRED_MAX_VALUE_SIZE) as usize;
+
+/// Refuse a `{user}.{service}` spelling too long for the attributes of one record to hold.
+pub(crate) fn validate_spelling(spelling: &str) -> Result<()> {
+    if spelling.len() > MAX_SPELLING_LEN {
+        return Err(Error::TooLong(
+            "service and user".into(),
+            u32::try_from(MAX_SPELLING_LEN).expect("the spelling bound fits u32"),
+        ));
+    }
+    Ok(())
+}
+
+/// Save a sealed entry's record, keeping the caller's `spelling` of its name in its attributes.
+pub(crate) fn save_spelled_credential(
+    target_name: &str,
+    user: &str,
+    target_alias: &str,
+    comment: &str,
+    secret: &[u8],
+    spelling: &str,
+) -> Result<()> {
+    let mut keywords: Vec<Vec<u16>> = Vec::new();
+    let mut values: Vec<Vec<u8>> = Vec::new();
+    for (index, chunk) in spelling
+        .as_bytes()
+        .chunks(CRED_MAX_VALUE_SIZE as usize)
+        .enumerate()
+    {
+        keywords.push(to_wstr(&format!("{SPELLING_KEYWORD}{index}")));
+        values.push(chunk.to_vec());
+    }
+    let mut attributes: Vec<CREDENTIAL_ATTRIBUTEW> = keywords
+        .iter_mut()
+        .zip(&mut values)
+        .map(|(keyword, value)| CREDENTIAL_ATTRIBUTEW {
+            Keyword: keyword.as_mut_ptr(),
+            Flags: 0,
+            ValueSize: u32::try_from(value.len()).expect("a chunk holds at most 256 bytes"),
+            Value: value.as_mut_ptr(),
+        })
+        .collect();
+    write_credential(
+        target_name,
+        user,
+        target_alias,
+        comment,
+        secret,
+        &CredPersist::Local,
+        &mut attributes,
+    )
+}
+
+fn write_credential(
+    target_name: &str,
+    user: &str,
+    target_alias: &str,
+    comment: &str,
+    secret: &[u8],
+    persistence: &CredPersist,
+    attributes: &mut [CREDENTIAL_ATTRIBUTEW],
+) -> Result<()> {
     let mut username = to_wstr(user);
     let mut target_name = to_wstr(target_name);
     let mut target_alias = to_wstr(target_alias);
@@ -219,8 +297,6 @@ pub fn save_credential(
         dwLowDateTime: 0,
         dwHighDateTime: 0,
     };
-    let attribute_count = 0;
-    let attributes: *mut CREDENTIAL_ATTRIBUTEW = std::ptr::null_mut();
     let credential = CREDENTIALW {
         Flags: flags,
         Type: cred_type,
@@ -230,8 +306,12 @@ pub fn save_credential(
         CredentialBlobSize: blob_len,
         CredentialBlob: blob.as_mut_ptr(),
         Persist: persist,
-        AttributeCount: attribute_count,
-        Attributes: attributes,
+        AttributeCount: u32::try_from(attributes.len()).expect("at most 64 attributes"),
+        Attributes: if attributes.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            attributes.as_mut_ptr()
+        },
         TargetAlias: target_alias.as_mut_ptr(),
         UserName: username.as_mut_ptr(),
     };
@@ -244,6 +324,51 @@ pub fn save_credential(
     // erase the copy of the secret
     blob.zeroize();
     result
+}
+
+/// A name in the case Credential Manager compares target names in.
+///
+/// Credential Manager matches targets by the Windows invariant upper case of each UTF-16 unit,
+/// which differs from Rust's `to_uppercase` on hundreds of characters such as `ſ`, so two names
+/// it treats as one target have equal folded forms and no others do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FoldedName(String);
+
+impl FoldedName {
+    pub(crate) fn new(name: &str) -> Result<Self> {
+        let units: Vec<u16> = name.encode_utf16().collect();
+        if units.is_empty() {
+            return Ok(Self(String::new()));
+        }
+        let length = i32::try_from(units.len())
+            .map_err(|_| Error::TooLong(name.to_owned(), i32::MAX.cast_unsigned()))?;
+        let mut folded = vec![0u16; units.len()];
+        // SAFETY: both buffers hold `length` units, and the invariant locale needs no version
+        // information or sort handle.
+        let written = unsafe {
+            LCMapStringEx(
+                LOCALE_NAME_INVARIANT,
+                LCMAP_UPPERCASE,
+                units.as_ptr(),
+                length,
+                folded.as_mut_ptr(),
+                length,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            )
+        };
+        if written != length {
+            return Err(decode_error());
+        }
+        // Upper-casing maps each unit to one unit and leaves surrogates alone, so `name`'s
+        // valid UTF-16 stays valid.
+        Ok(Self(String::from_utf16_lossy(&folded)))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Delete a generic credential
@@ -355,6 +480,7 @@ pub fn cred_from_credential(credential: &mut CREDENTIALW) -> Cred {
         target_name,
         specifiers: None,
         persistence,
+        sealed: None,
     }
 }
 
@@ -429,6 +555,12 @@ pub fn extract_attributes(credential: &CREDENTIALW) -> Result<HashMap<String, St
         ),
     ]);
     Ok(result)
+}
+
+/// The target name of a credential returned by `CredReadW` or `CredEnumerateW`.
+pub(crate) fn target_name(credential: &CREDENTIALW) -> String {
+    // SAFETY: Credential Manager returns a NUL-terminated `TargetName` valid while `credential` lives.
+    unsafe { from_wstr(credential.TargetName) }
 }
 
 /// Lowercase hexadecimal encoding of `bytes`.
@@ -582,5 +714,15 @@ mod tests {
     fn hex_spells_each_byte_as_two_lowercase_digits() {
         assert_eq!(hex(&[]), "");
         assert_eq!(hex(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
+    }
+
+    #[test]
+    fn target_name_decodes_the_credential_target() {
+        let mut target = to_wstr("keyring:target");
+        let credential = CREDENTIALW {
+            TargetName: target.as_mut_ptr(),
+            ..Default::default()
+        };
+        assert_eq!(target_name(&credential), "keyring:target");
     }
 }
