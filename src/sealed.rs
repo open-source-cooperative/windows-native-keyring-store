@@ -11,6 +11,9 @@ pub enum SealError {
     /// Credential Manager or another Windows service failed.
     #[error("sealed store operation failed ({0})")]
     Platform(String),
+    /// Another process held the store's lock for too long.
+    #[error("sealed store lock timed out")]
+    TimedOut,
 }
 
 impl From<SealError> for Error {
@@ -18,6 +21,30 @@ impl From<SealError> for Error {
         match error {
             SealError::Corrupt(reason) => Error::BadStoreFormat(reason),
             SealError::Platform(_) => Error::PlatformFailure(Box::new(error)),
+            _ => Error::NoStorageAccess(Box::new(error)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use keyring_core::Error;
+
+    use super::SealError;
+
+    #[test]
+    fn seal_errors_map_to_keyring_error_kinds() {
+        assert!(matches!(
+            Error::from(SealError::Corrupt("record".into())),
+            Error::BadStoreFormat(reason) if reason == "record"
+        ));
+        assert!(matches!(
+            Error::from(SealError::Platform("service".into())),
+            Error::PlatformFailure(_)
+        ));
+        assert!(matches!(
+            Error::from(SealError::TimedOut),
+            Error::NoStorageAccess(_)
+        ));
     }
 }
