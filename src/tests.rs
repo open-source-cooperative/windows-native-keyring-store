@@ -94,12 +94,7 @@ fn test_reads_wait_for_the_windows_user_mutex() {
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::time::Duration;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
-    use windows_sys::Win32::Security::{
-        GetLengthSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
-    };
-    use windows_sys::Win32::System::Threading::{
-        CreateMutexW, GetCurrentProcess, OpenProcessToken, ReleaseMutex, WaitForSingleObject,
-    };
+    use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 
     struct NativeHandle(HANDLE);
 
@@ -135,40 +130,16 @@ fn test_reads_wait_for_the_windows_user_mutex() {
     let run_id = generate_random_string();
     let entry = entry_new(&run_id, &run_id);
     std::thread::scope(|scope| {
-        // `user_sid` mutations must not change the kernel mutex oracle.
-        let mut token = std::ptr::null_mut();
-        // SAFETY: The current process pseudo-handle is valid and `token` is writable.
-        let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
-        assert_ne!(opened, 0);
-        let token = NativeHandle(token);
-        let mut buffer = [0u64; 11];
-        let mut written = 0;
-        // SAFETY: The live token is queryable and the aligned buffer holds `TOKEN_USER` and a maximum-size `SID`.
-        let queried = unsafe {
-            GetTokenInformation(
-                token.0,
-                TokenUser,
-                buffer.as_mut_ptr().cast(),
-                u32::try_from(size_of_val(&buffer)).unwrap(),
-                &mut written,
-            )
-        };
-        assert_ne!(queried, 0);
-        // SAFETY: The successful query initialized `TOKEN_USER` inside the aligned buffer.
-        let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-        // SAFETY: The `SID` remains valid while its token-information buffer lives.
-        let length = usize::try_from(unsafe { GetLengthSid(sid) }).unwrap();
-        // SAFETY: The successful query and `GetLengthSid` bound the `SID` inside the live buffer.
-        let sid = unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), length) };
-        let prefix = "Global\\windows-native-keyring-store-";
-        let hex = b"0123456789abcdef";
-        let mut name = Vec::with_capacity(prefix.len() + 2 * sid.len() + 1);
-        name.extend(prefix.encode_utf16());
-        for byte in sid {
-            name.push(u16::from(hex[usize::from(byte >> 4)]));
-            name.push(u16::from(hex[usize::from(byte & 15)]));
-        }
-        name.push(0);
+        // `user_lock` mutations must not change the kernel mutex oracle, which names the mutex on
+        // its own. `entry_new` has already entered the namespace, and a process cannot open a
+        // namespace it holds a second time.
+        let digits: String = process_user_sid()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let name: Vec<u16> = format!("windows-native-keyring-store-v1-{digits}\\call\0")
+            .encode_utf16()
+            .collect();
         // SAFETY: The UTF-16 buffer includes its terminator and the API accepts a `null` descriptor.
         let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
         assert!(!handle.is_null());
@@ -201,6 +172,41 @@ fn test_reads_wait_for_the_windows_user_mutex() {
         assert_eq!(reply_id, run_id);
         assert!(matches!(result, Err(Error::NoEntry)));
     });
+}
+
+/// The user `SID` of the process token, read without the code under test.
+pub(crate) fn process_user_sid() -> Vec<u8> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{
+        GetLengthSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = std::ptr::null_mut();
+    // SAFETY: The current process pseudo-handle is valid and `token` is writable.
+    let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+    assert_ne!(opened, 0);
+    let mut buffer = [0u64; 11];
+    let mut written = 0;
+    // SAFETY: The live token is queryable and the aligned buffer holds `TOKEN_USER` and a maximum-size `SID`.
+    let queried = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            u32::try_from(size_of_val(&buffer)).unwrap(),
+            &mut written,
+        )
+    };
+    // SAFETY: `token` was opened above and is closed once.
+    unsafe { CloseHandle(token) };
+    assert_ne!(queried, 0);
+    // SAFETY: The successful query initialized `TOKEN_USER` inside the aligned buffer.
+    let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    // SAFETY: The `SID` remains valid while its token-information buffer lives.
+    let length = usize::try_from(unsafe { GetLengthSid(sid) }).unwrap();
+    // SAFETY: The successful query and `GetLengthSid` bound the `SID` inside the live buffer.
+    unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), length) }.to_vec()
 }
 
 fn generate_random_bytes() -> Vec<u8> {
@@ -338,6 +344,13 @@ fn test_round_trip_non_ascii_password() {
     let name = generate_random_string();
     let entry = entry_new(&name, &name);
     test_round_trip("non-ascii password", &entry, "このきれいな花は桜です");
+}
+
+#[test]
+fn test_round_trip_password_starting_with_a_noncharacter() {
+    let name = generate_random_string();
+    let entry = entry_new(&name, &name);
+    test_round_trip("noncharacter password", &entry, "\u{ffff}secret");
 }
 
 #[test]
@@ -681,4 +694,17 @@ fn test_store_persistence() {
         store.persistence(),
         CredentialPersistence::UntilDelete
     ));
+}
+
+#[test]
+fn ordinary_binary_secret_with_protected_prefix_remains_readable() {
+    let entry = entry_new("binary-secret", &generate_random_string());
+    let secret = b"\x00\xdc\x01binary";
+    entry.set_secret(secret).unwrap();
+    assert_eq!(entry.get_secret().unwrap(), secret);
+    assert!(matches!(
+        entry.get_password(),
+        Err(Error::BadStoreFormat(_))
+    ));
+    entry.delete_credential().unwrap();
 }

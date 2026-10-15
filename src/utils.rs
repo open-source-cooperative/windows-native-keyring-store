@@ -16,12 +16,12 @@ use windows_sys::Win32::Security::Credentials::{
     CRED_PERSIST_LOCAL_MACHINE, CRED_PERSIST_SESSION, CRED_TYPE_GENERIC, CREDENTIAL_ATTRIBUTEW,
     CREDENTIALW, CredDeleteW, CredFree, CredReadW, CredWriteW,
 };
-use windows_sys::Win32::Security::{GetLengthSid, GetTokenInformation, TOKEN_USER, TokenUser};
 use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 use zeroize::Zeroize;
 
 #[cfg(feature = "search")]
 use crate::cred::Cred;
+use crate::sealed_crypto::is_protected;
 use keyring_core::error::{Error, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,7 +143,7 @@ impl CallLock {
     }
 
     fn acquire_within(timeout_ms: u32) -> Result<Self> {
-        let name = lock_name()?;
+        let name = crate::user_lock::object_name("call")?;
         // SAFETY: Default security and a terminated name.
         let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
         if handle.is_null() {
@@ -183,6 +183,7 @@ impl Drop for CallLock {
 /// once instead of waiting out the lock timeout when locks are not released.
 #[cfg(test)]
 pub(crate) fn assert_call_lock_released() {
+    crate::user_lock::assert_names_distinct();
     static RELEASED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         drop(CallLock::acquire_within(5_000).expect("the call lock"));
         std::thread::scope(|scope| {
@@ -193,46 +194,6 @@ pub(crate) fn assert_call_lock_released() {
         })
     });
     assert!(*RELEASED, "a dropped call lock stays held");
-}
-
-/// Names the lock after the user, whose credential set it guards.
-fn lock_name() -> Result<Vec<u16>> {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut name: Vec<u16> = "Global\\windows-native-keyring-store-"
-        .encode_utf16()
-        .collect();
-    for byte in user_sid()? {
-        name.extend([HEX[usize::from(byte >> 4)], HEX[usize::from(byte & 15)]].map(u16::from));
-    }
-    name.push(0);
-    Ok(name)
-}
-
-/// Returns the SID of the thread's effective token, which selects the credential set.
-fn user_sid() -> Result<Vec<u8>> {
-    // `GetCurrentThreadEffectiveToken()` pseudo-handle from `processthreadsapi.h`.
-    let token = ptr::without_provenance_mut((-6isize).cast_unsigned());
-    let mut buffer = [0usize; 16];
-    let mut written = 0;
-    // SAFETY: Queryable pseudo-token, writable aligned buffer of the given size and result pointer.
-    if unsafe {
-        GetTokenInformation(
-            token,
-            TokenUser,
-            buffer.as_mut_ptr().cast(),
-            size_of_val(&buffer) as u32,
-            &mut written,
-        )
-    } == 0
-    {
-        return Err(decode_error());
-    }
-    // SAFETY: Success wrote a `TOKEN_USER` whose SID lies inside `buffer`.
-    let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-    // SAFETY: `sid` is valid while `buffer` lives.
-    let length = unsafe { GetLengthSid(sid) } as usize;
-    // SAFETY: `GetLengthSid` bounds the SID bytes inside `buffer`.
-    Ok(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), length) }.to_vec())
 }
 
 /// Save or create a generic credential with pre-validated data
@@ -399,38 +360,48 @@ pub fn cred_from_credential(credential: &mut CREDENTIALW) -> Cred {
 
 /// A password extractor for use with [extract_from_credential].
 pub fn extract_password(credential: &CREDENTIALW) -> Result<String> {
-    let mut blob = extract_secret(credential)?;
-    // 3rd parties may write credential data with an odd number of bytes,
-    // so we make sure that we don't try to decode those as utf16
-    if blob.len() % 2 != 0 {
+    let blob = credential_blob(credential);
+    if is_protected(blob) {
+        return Err(Error::BadStoreFormat(
+            "protected credential requires a sealed store".into(),
+        ));
+    }
+    password_from_secret(blob.to_vec())
+}
+
+pub(crate) fn password_from_secret(mut blob: Vec<u8>) -> Result<String> {
+    if !blob.len().is_multiple_of(2) {
         return Err(Error::BadEncoding(blob));
     }
-    // This should be a UTF-16 string, so convert it to
-    // a UTF-16 vector and then try to decode it.
     let mut blob_u16 = vec![0; blob.len() / 2];
     LittleEndian::read_u16_into(&blob, &mut blob_u16);
     let result = match String::from_utf16(&blob_u16) {
         Err(_) => Err(Error::BadEncoding(blob)),
         Ok(s) => {
-            // we aren't returning the blob, so clear it
             blob.zeroize();
             Ok(s)
         }
     };
-    // we aren't returning the utf16 blob, so clear it
     blob_u16.zeroize();
     result
 }
 
 /// A secret extractor for use with [extract_from_credential].
 pub fn extract_secret(credential: &CREDENTIALW) -> Result<Vec<u8>> {
-    let blob_pointer: *const u8 = credential.CredentialBlob;
-    let blob_len: usize = credential.CredentialBlobSize as usize;
-    if blob_len == 0 {
-        return Ok(Vec::new());
+    Ok(credential_blob(credential).to_vec())
+}
+
+fn credential_blob(credential: &CREDENTIALW) -> &[u8] {
+    if credential.CredentialBlobSize == 0 {
+        return &[];
     }
-    let blob = unsafe { std::slice::from_raw_parts(blob_pointer, blob_len) };
-    Ok(blob.to_vec())
+    // SAFETY: Credential Manager owns `CredentialBlobSize` bytes at `CredentialBlob` while `credential` lives.
+    unsafe {
+        std::slice::from_raw_parts(
+            credential.CredentialBlob,
+            usize::try_from(credential.CredentialBlobSize).expect("u32 fits usize on Windows"),
+        )
+    }
 }
 
 /// A metadata extractor for use with [extract_from_credential].
@@ -460,6 +431,16 @@ pub fn extract_attributes(credential: &CREDENTIALW) -> Result<HashMap<String, St
     Ok(result)
 }
 
+/// Lowercase hexadecimal encoding of `bytes`.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    bytes
+        .iter()
+        .flat_map(|byte| [byte >> 4, byte & 15])
+        .map(|nibble| char::from(DIGITS[usize::from(nibble)]))
+        .collect()
+}
+
 /// helper for extract_from_platform
 fn erase_secret(credential: &mut CREDENTIALW) {
     let blob_pointer: *mut u8 = credential.CredentialBlob;
@@ -479,7 +460,11 @@ fn to_wstr_no_null(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
 
-unsafe fn from_wstr(ws: *const u16) -> String {
+/// Reads a NUL-terminated wide string, returning an empty string for null.
+///
+/// # Safety
+/// `ws` must be null or point to a NUL-terminated UTF-16 string valid for the call.
+pub(crate) unsafe fn from_wstr(ws: *const u16) -> String {
     // null pointer case, return empty string
     if ws.is_null() {
         return String::new();
@@ -563,5 +548,39 @@ mod tests {
             scope.spawn(|| std::mem::forget(CallLock::acquire().unwrap()));
         });
         assert!(CallLock::acquire().is_ok());
+    }
+
+    #[test]
+    fn a_global_squatter_cannot_hold_the_call_lock() {
+        let name: Vec<u16> = format!(
+            "Global\\windows-native-keyring-store-{}\0",
+            hex(&crate::tests::process_user_sid())
+        )
+        .encode_utf16()
+        .collect();
+        // SAFETY: The name is NUL-terminated, and this thread takes initial ownership.
+        let squatter = unsafe { CreateMutexW(ptr::null(), 1, name.as_ptr()) };
+        assert!(!squatter.is_null());
+        let acquired = std::thread::scope(|scope| {
+            scope
+                .spawn(|| CallLock::acquire_within(2_000).is_ok())
+                .join()
+                .unwrap()
+        });
+        // SAFETY: This thread owns `squatter` and releases and closes it once.
+        unsafe {
+            ReleaseMutex(squatter);
+            CloseHandle(squatter);
+        }
+        assert!(
+            acquired,
+            "a same-named machine-global mutex blocked the call lock"
+        );
+    }
+
+    #[test]
+    fn hex_spells_each_byte_as_two_lowercase_digits() {
+        assert_eq!(hex(&[]), "");
+        assert_eq!(hex(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
     }
 }
