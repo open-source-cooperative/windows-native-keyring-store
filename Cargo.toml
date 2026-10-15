@@ -6,7 +6,7 @@ keywords = ["windows", "credential-manager", "credential-store", "keyring"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/open-source-cooperative/windows-native-keyring-store.git"
 rust-version = "1.88"
-exclude = [".github/"]
+exclude = [".cargo/", ".github/", "tools/"]
 readme = "README.md"
 name = "windows-native-keyring-store"
 version = "1.1.0"
@@ -21,6 +21,7 @@ aes-gcm = { version = "0.11", default-features = false, features = ["aes", "allo
 byteorder = "1"
 getrandom = "0.4"
 keyring-core = { version = "1" }
+libloading = "0.9"
 regex = { version = "1", optional = true }
 sha2 = "0.11"
 thiserror = "2"
