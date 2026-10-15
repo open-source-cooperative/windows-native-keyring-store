@@ -101,6 +101,12 @@ impl CredentialStoreApi for SealedStore {
         self.gate.build(service, user, modifiers)
     }
 
+    /// Search this store's entries, optionally by a `pattern` on their `{user}.{service}` name.
+    #[cfg(feature = "search")]
+    fn search(&self, spec: &HashMap<&str, &str>) -> Result<Vec<Entry>> {
+        self.gate.search(spec)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
