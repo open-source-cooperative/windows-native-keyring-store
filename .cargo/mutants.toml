@@ -1,0 +1,5 @@
+exclude_re = [
+    # Frees the one-time allocations of entering a user's lock namespace, which no behavior observes.
+    "src/user_lock\\.rs:.*: replace <impl Drop for LocalMemory>::drop with \\(\\)$",
+    "src/user_lock\\.rs:.*: replace <impl Drop for Boundary>::drop with \\(\\)$",
+]
