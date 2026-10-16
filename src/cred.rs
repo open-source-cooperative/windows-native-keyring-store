@@ -32,7 +32,7 @@ impl Cred {
     /// An explicit target string is interpreted as the target to use for the entry.
     /// If none is provided, then we concatenate the user and service in the string
     /// `{delimiters[0]}{user}{delimiters[1]}{service}{delimiters[2]}`.
-    pub fn build_from_specifiers(
+    pub(crate) fn build_from_specifiers(
         target: Option<&str>,
         delimiters: &[String; 3],
         service_no_dividers: bool,

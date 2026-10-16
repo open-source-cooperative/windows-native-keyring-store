@@ -27,5 +27,8 @@ zeroize = "1"
 fastrand = "2"
 sscanf = "0.5"
 
+[lints.rust]
+unreachable_pub = "warn"
+
 [package.metadata.docs.rs]
 targets = ["x86_64-pc-windows-msvc"]
