@@ -62,7 +62,7 @@ impl std::str::FromStr for CredPersist {
     }
 }
 
-pub fn validate_target(target: &str, user: &str) -> Result<()> {
+pub(crate) fn validate_target(target: &str, user: &str) -> Result<()> {
     if user.len() > CRED_MAX_USERNAME_LENGTH as usize {
         return Err(Error::TooLong(
             String::from("user"),
@@ -84,7 +84,7 @@ pub fn validate_target(target: &str, user: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn validate_password(password: &str) -> Result<Vec<u8>> {
+pub(crate) fn validate_password(password: &str) -> Result<Vec<u8>> {
     let mut blob_u16 = to_wstr_no_null(password);
     let mut blob = vec![0; blob_u16.len() * 2];
     LittleEndian::write_u16_into(&blob_u16, &mut blob);
@@ -101,7 +101,7 @@ pub fn validate_password(password: &str) -> Result<Vec<u8>> {
     }
 }
 
-pub fn validate_secret(secret: &[u8]) -> Result<()> {
+pub(crate) fn validate_secret(secret: &[u8]) -> Result<()> {
     if secret.len() > CRED_MAX_CREDENTIAL_BLOB_SIZE as usize {
         return Err(Error::TooLong(
             String::from("secret"),
@@ -111,7 +111,7 @@ pub fn validate_secret(secret: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub fn validate_attributes(username: &str, target_alias: &str, comment: &str) -> Result<()> {
+pub(crate) fn validate_attributes(username: &str, target_alias: &str, comment: &str) -> Result<()> {
     if username.len() > CRED_MAX_USERNAME_LENGTH as usize {
         return Err(Error::TooLong(
             String::from("user"),
@@ -240,7 +240,7 @@ fn user_sid() -> Result<Vec<u8>> {
 }
 
 /// Save or create a generic credential with pre-validated data
-pub fn save_credential(
+pub(crate) fn save_credential(
     target_name: &str,
     user: &str,
     target_alias: &str,
@@ -290,7 +290,7 @@ pub fn save_credential(
 }
 
 /// Delete a generic credential
-pub fn delete_credential(target_name: &str) -> Result<()> {
+pub(crate) fn delete_credential(target_name: &str) -> Result<()> {
     let target_name = to_wstr(target_name);
     let cred_type = CRED_TYPE_GENERIC;
     let _lock = CallLock::acquire()?;
@@ -314,7 +314,7 @@ pub(crate) fn delete_test_record(target_name: &str) {
 
 /// Enumerate generic credentials
 #[cfg(feature = "search")]
-pub fn enumerate_credentials(
+pub(crate) fn enumerate_credentials(
     pattern: Option<regex::Regex>,
     delimiters: &[String; 3],
 ) -> Result<Vec<Cred>> {
@@ -354,7 +354,7 @@ pub fn enumerate_credentials(
 }
 
 /// Run a function over a generic credential to extract data from it.
-pub fn extract_from_credential<F, T>(target_name: &str, f: F) -> Result<T>
+pub(crate) fn extract_from_credential<F, T>(target_name: &str, f: F) -> Result<T>
 where
     F: FnOnce(&CREDENTIALW) -> Result<T>,
 {
@@ -386,7 +386,7 @@ where
 
 /// get a Cred from a native credential
 #[cfg(feature = "search")]
-pub fn cred_from_credential(credential: &mut CREDENTIALW) -> Cred {
+fn cred_from_credential(credential: &mut CREDENTIALW) -> Cred {
     erase_secret(credential); // erase the secret, so it won't be leaked into the heap
     let persistence = match credential.Persist {
         CRED_PERSIST_SESSION => CredPersist::Session,
@@ -402,7 +402,7 @@ pub fn cred_from_credential(credential: &mut CREDENTIALW) -> Cred {
 }
 
 /// A password extractor for use with [extract_from_credential].
-pub fn extract_password(credential: &CREDENTIALW) -> Result<String> {
+pub(crate) fn extract_password(credential: &CREDENTIALW) -> Result<String> {
     let mut blob = extract_secret(credential)?;
     // 3rd parties may write credential data with an odd number of bytes,
     // so we make sure that we don't try to decode those as utf16
@@ -427,7 +427,7 @@ pub fn extract_password(credential: &CREDENTIALW) -> Result<String> {
 }
 
 /// A secret extractor for use with [extract_from_credential].
-pub fn extract_secret(credential: &CREDENTIALW) -> Result<Vec<u8>> {
+pub(crate) fn extract_secret(credential: &CREDENTIALW) -> Result<Vec<u8>> {
     let blob_pointer: *const u8 = credential.CredentialBlob;
     let blob_len: usize = credential.CredentialBlobSize as usize;
     if blob_len == 0 {
@@ -438,7 +438,7 @@ pub fn extract_secret(credential: &CREDENTIALW) -> Result<Vec<u8>> {
 }
 
 /// A metadata extractor for use with [extract_from_credential].
-pub fn extract_attributes(credential: &CREDENTIALW) -> Result<HashMap<String, String>> {
+pub(crate) fn extract_attributes(credential: &CREDENTIALW) -> Result<HashMap<String, String>> {
     let result = HashMap::from([
         ("target_name".to_string(), unsafe {
             from_wstr(credential.TargetName)
@@ -528,7 +528,7 @@ impl std::error::Error for WindowsErrorCode {
 }
 
 /// Map the last encountered Windows API error to a crate error with appropriate annotation.
-pub fn decode_error() -> Error {
+fn decode_error() -> Error {
     match unsafe { GetLastError() } {
         ERROR_NOT_FOUND => Error::NoEntry,
         ERROR_NO_SUCH_LOGON_SESSION => Error::NoStorageAccess(wrap(ERROR_NO_SUCH_LOGON_SESSION)),
