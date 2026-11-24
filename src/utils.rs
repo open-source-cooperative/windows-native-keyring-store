@@ -16,7 +16,6 @@ use windows_sys::Win32::Security::Credentials::{
     CRED_PERSIST_LOCAL_MACHINE, CRED_PERSIST_SESSION, CRED_TYPE_GENERIC, CREDENTIAL_ATTRIBUTEW,
     CREDENTIALW, CredDeleteW, CredFree, CredReadW, CredWriteW,
 };
-use windows_sys::Win32::Security::{GetLengthSid, GetTokenInformation, TOKEN_USER, TokenUser};
 use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 use zeroize::Zeroize;
 
@@ -147,7 +146,7 @@ impl CallLock {
     }
 
     fn acquire_within(timeout_ms: u32) -> Result<Self> {
-        let name = lock_name()?;
+        let name = crate::user_lock::object_name("call")?;
         // SAFETY: Default security and a terminated name.
         let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
         if handle.is_null() {
@@ -187,6 +186,7 @@ impl Drop for CallLock {
 /// once instead of waiting out the lock timeout when locks are not released.
 #[cfg(test)]
 pub(crate) fn assert_call_lock_released() {
+    crate::user_lock::assert_names_distinct();
     static RELEASED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         drop(CallLock::acquire_within(5_000).expect("the call lock"));
         std::thread::scope(|scope| {
@@ -197,46 +197,6 @@ pub(crate) fn assert_call_lock_released() {
         })
     });
     assert!(*RELEASED, "a dropped call lock stays held");
-}
-
-/// Names the lock after the user, whose credential set it guards.
-fn lock_name() -> Result<Vec<u16>> {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut name: Vec<u16> = "Global\\windows-native-keyring-store-"
-        .encode_utf16()
-        .collect();
-    for byte in user_sid()? {
-        name.extend([HEX[usize::from(byte >> 4)], HEX[usize::from(byte & 15)]].map(u16::from));
-    }
-    name.push(0);
-    Ok(name)
-}
-
-/// Returns the SID of the thread's effective token, which selects the credential set.
-fn user_sid() -> Result<Vec<u8>> {
-    // `GetCurrentThreadEffectiveToken()` pseudo-handle from `processthreadsapi.h`.
-    let token = ptr::without_provenance_mut((-6isize).cast_unsigned());
-    let mut buffer = [0usize; 16];
-    let mut written = 0;
-    // SAFETY: Queryable pseudo-token, writable aligned buffer of the given size and result pointer.
-    if unsafe {
-        GetTokenInformation(
-            token,
-            TokenUser,
-            buffer.as_mut_ptr().cast(),
-            size_of_val(&buffer) as u32,
-            &mut written,
-        )
-    } == 0
-    {
-        return Err(decode_error());
-    }
-    // SAFETY: Success wrote a `TOKEN_USER` whose SID lies inside `buffer`.
-    let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-    // SAFETY: `sid` is valid while `buffer` lives.
-    let length = unsafe { GetLengthSid(sid) } as usize;
-    // SAFETY: `GetLengthSid` bounds the SID bytes inside `buffer`.
-    Ok(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), length) }.to_vec())
 }
 
 /// Save or create a generic credential with pre-validated data
@@ -464,6 +424,16 @@ pub fn extract_attributes(credential: &CREDENTIALW) -> Result<HashMap<String, St
     Ok(result)
 }
 
+/// Lowercase hexadecimal encoding of `bytes`.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    bytes
+        .iter()
+        .flat_map(|byte| [byte >> 4, byte & 15])
+        .map(|nibble| char::from(DIGITS[usize::from(nibble)]))
+        .collect()
+}
+
 /// helper for extract_from_platform
 fn erase_secret(credential: &mut CREDENTIALW) {
     let blob_pointer: *mut u8 = credential.CredentialBlob;
@@ -483,7 +453,11 @@ fn to_wstr_no_null(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
 
-unsafe fn from_wstr(ws: *const u16) -> String {
+/// Reads a NUL-terminated wide string, returning an empty string for null.
+///
+/// # Safety
+/// `ws` must be null or point to a NUL-terminated UTF-16 string valid for the call.
+pub(crate) unsafe fn from_wstr(ws: *const u16) -> String {
     // null pointer case, return empty string
     if ws.is_null() {
         return String::new();
@@ -574,5 +548,39 @@ mod tests {
             scope.spawn(|| std::mem::forget(CallLock::acquire().unwrap()));
         });
         assert!(CallLock::acquire().is_ok());
+    }
+
+    #[test]
+    fn a_global_squatter_cannot_hold_the_call_lock() {
+        let name: Vec<u16> = format!(
+            "Global\\windows-native-keyring-store-{}\0",
+            hex(&crate::tests::process_user_sid())
+        )
+        .encode_utf16()
+        .collect();
+        // SAFETY: The name is NUL-terminated, and this thread takes initial ownership.
+        let squatter = unsafe { CreateMutexW(ptr::null(), 1, name.as_ptr()) };
+        assert!(!squatter.is_null());
+        let acquired = std::thread::scope(|scope| {
+            scope
+                .spawn(|| CallLock::acquire_within(2_000).is_ok())
+                .join()
+                .unwrap()
+        });
+        // SAFETY: This thread owns `squatter` and releases and closes it once.
+        unsafe {
+            ReleaseMutex(squatter);
+            CloseHandle(squatter);
+        }
+        assert!(
+            acquired,
+            "a same-named machine-global mutex blocked the call lock"
+        );
+    }
+
+    #[test]
+    fn hex_spells_each_byte_as_two_lowercase_digits() {
+        assert_eq!(hex(&[]), "");
+        assert_eq!(hex(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
     }
 }
